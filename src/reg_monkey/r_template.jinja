@@ -1,0 +1,357 @@
+{% macro install_required_packages(required_libraries) -%}
+required_packages <- c("{{ required_libraries | join('", "') }}")
+
+options(repos = c(CRAN = "https://cloud.r-project.org"),
+        download.file.method = "libcurl")
+
+for (pkg in required_packages) {
+  if (requireNamespace(pkg, quietly = TRUE)) {
+    library(pkg, character.only = TRUE)
+  } else {
+    utils::install.packages(pkg,
+      dependencies = c("Depends","Imports","LinkingTo"),
+      type = "binary",                    # 有二进制就用
+      Ncpus = max(1, parallel::detectCores()-1),
+      quiet = TRUE
+    )
+    library(pkg, character.only = TRUE)
+  }
+}
+{%- endmacro %}
+
+{% macro extract_coefficients() -%}
+extract_coefficients_OLS <- function(fit) {
+  tryCatch({
+    if (is.null(fit) || !inherits(fit, "lm")) {
+      stop("Input must be an 'lm' object.")
+    }
+
+    s  <- summary(fit)
+
+    # 观测量与 R^2
+    n_obs <- tryCatch(stats::nobs(fit), error = function(e) NA_integer_)
+    r2    <- if (!is.null(s$r.squared)) as.numeric(s$r.squared) else NA_real_
+
+    # 系数矩阵 -> data.frame
+    cm <- s$coefficients
+    if (is.null(cm)) {
+      coef_df <- data.frame(
+        Variable  = character(0),
+        Estimate  = numeric(0),
+        Std_Error = numeric(0),
+        T_Value   = numeric(0),
+        P_Value   = numeric(0),
+        stringsAsFactors = FALSE
+      )
+    } else {
+      coef_df <- as.data.frame(cm, stringsAsFactors = FALSE)
+
+      # 添加变量名列并重置行名
+      coef_df$Variable <- rownames(coef_df)
+      rownames(coef_df) <- NULL
+
+      # 统一列名（与需求一致）
+      names(coef_df) <- sub("^Estimate$",      "Estimate",  names(coef_df))
+      names(coef_df) <- sub("^Std\\. Error$",  "Std_Error", names(coef_df))
+      names(coef_df) <- sub("^t value$",       "T_Value",   names(coef_df))
+      names(coef_df) <- sub("^Pr\\(>\\|t\\|\\)$", "P_Value", names(coef_df))
+
+      # 只保留并按需排序列；缺列时安全补 NA
+      required_cols <- c("Variable", "Estimate", "Std_Error", "T_Value", "P_Value")
+      for (col in required_cols) {
+        if (!col %in% names(coef_df)) {
+          coef_df[[col]] <- if (col == "Variable") NA_character_ else NA_real_
+        }
+      }
+      coef_df <- coef_df[, required_cols]
+
+      # 确保基础类型，便于 rpy2 -> pandas
+      coef_df[["Variable"]]  <- as.character(coef_df[["Variable"]])
+      coef_df[["Estimate"]]  <- as.numeric(coef_df[["Estimate"]])
+      coef_df[["Std_Error"]] <- as.numeric(coef_df[["Std_Error"]])
+      coef_df[["T_Value"]]   <- as.numeric(coef_df[["T_Value"]])
+      coef_df[["P_Value"]]   <- as.numeric(coef_df[["P_Value"]])
+    }
+
+    # 返回“字典”（named list）
+    list(
+      "Observations" = as.integer(n_obs),
+      "R-squared"    = as.numeric(r2),
+      "coefficients" = coef_df
+    )
+  }, error = function(e) {
+    "No results given by the current subsample."
+  })
+}
+# 适用于 plm::plm() 的 FE/RE 结果解析；失败时返回指定字符串
+extract_coefficients_plm <- function(fit) {
+  tryCatch({
+    if (is.null(fit) || !inherits(fit, "plm")) {
+      stop("Input must be a 'plm' object.")
+    }
+
+    # ---------------- 基本统计量 ----------------
+    n_obs <- tryCatch(stats::nobs(fit), error = function(e) NA_integer_)
+
+    # R^2：优先 overall，其次 within/between；若不可用，再从 summary 中兜底
+    r2 <- tryCatch({
+      # plm 提供的 r.squared 函数
+      rs <- tryCatch(plm::r.squared(fit), error = function(e) NULL)
+      if (is.list(rs)) {
+        if (!is.null(rs$overall)) {
+          as.numeric(rs$overall)
+        } else if (!is.null(rs$within)) {
+          as.numeric(rs$within)
+        } else if (!is.null(rs$between)) {
+          as.numeric(rs$between)
+        } else {
+          suppressWarnings(as.numeric(rs[[1]]))
+        }
+      } else {
+        # 兜底：从 summary.plm 中尝试
+        s <- summary(fit)
+        if (!is.null(s$r.squared)) {
+          if (is.list(s$r.squared)) {
+            # 常见字段名 rsq/adjrsq 或者 within/overall
+            cand <- c("overall", "within", "between", "rsq")
+            val <- NA_real_
+            for (nm in cand) {
+              if (!is.null(s$r.squared[[nm]])) { val <- as.numeric(s$r.squared[[nm]]); break }
+            }
+            if (is.na(val)) {
+              suppressWarnings(val <- as.numeric(s$r.squared[[1]]))
+            }
+            val
+          } else {
+            as.numeric(s$r.squared)
+          }
+        } else {
+          NA_real_
+        }
+      }
+    }, error = function(e) NA_real_)
+
+    # ---------------- 系数表 ----------------
+    s  <- summary(fit)
+    cm <- s$coefficients
+
+    if (is.null(cm)) {
+      coef_df <- data.frame(
+        Variable  = character(0),
+        Estimate  = numeric(0),
+        Std_Error = numeric(0),
+        T_Value   = numeric(0),
+        P_Value   = numeric(0),
+        stringsAsFactors = FALSE
+      )
+    } else {
+      coef_df <- as.data.frame(cm, stringsAsFactors = FALSE)
+
+      # 行名作为变量名列
+      coef_df$Variable <- rownames(coef_df)
+      rownames(coef_df) <- NULL
+
+      # 统一列名到目标规范（兼容 t-value / z-value、Pr(>|t|) / Pr(>|z|)）
+      nms <- names(coef_df)
+      nms <- sub("^Estimate$",        "Estimate",  nms)
+      nms <- sub("^Std\\.\\s*Error$", "Std_Error", nms)
+      nms <- sub("^(t|z)[ -]?value$", "T_Value",   nms, ignore.case = TRUE)
+      nms <- sub("^Pr\\(>\\|(t|z)\\|\\)$", "P_Value", nms)
+      names(coef_df) <- nms
+
+      # 只保留并按顺序排列所需列；缺失列做安全补 NA
+      required_cols <- c("Variable", "Estimate", "Std_Error", "T_Value", "P_Value")
+      for (col in required_cols) {
+        if (!col %in% names(coef_df)) {
+          coef_df[[col]] <- if (col == "Variable") NA_character_ else NA_real_
+        }
+      }
+      coef_df <- coef_df[, required_cols]
+
+      # 确保基础类型（便于 rpy2 -> pandas）
+      coef_df[["Variable"]]  <- as.character(coef_df[["Variable"]])
+      coef_df[["Estimate"]]  <- as.numeric(coef_df[["Estimate"]])
+      coef_df[["Std_Error"]] <- as.numeric(coef_df[["Std_Error"]])
+      coef_df[["T_Value"]]   <- as.numeric(coef_df[["T_Value"]])
+      coef_df[["P_Value"]]   <- as.numeric(coef_df[["P_Value"]])
+    }
+
+    # ---------------- 返回 named list ----------------
+    list(
+      "Observations" = as.integer(n_obs),
+      "R-squared"    = as.numeric(r2),
+      "coefficients" = coef_df
+    )
+  }, error = function(e) {
+    "No results given by the current subsample."
+  })
+}
+
+{%- endmacro %}
+
+{% macro EXTRACT_COEFS(parsed_name, regression_results_name, model="OLS", error_message="No results given by the current subsample.") -%}
+{% set _m = (model | string | upper) -%}
+{% if _m in ["FE", "RE", "PLM","OLS"] -%}
+  {% set fn = "extract_coefficients_plm" -%}
+{% elif _m == "" -%}
+  {% set fn = "" -%}
+{% else -%}
+  {% set fn = "extract_coefficients_" ~ model -%}
+{% endif -%}
+
+{{ parsed_name }} <- tryCatch({
+  {{ fn }}({{ regression_results_name }})
+}, error = function(e) { {{ error_message | tojson }} })
+{%- endmacro %}
+
+{% macro set_category_controls(fields=[], output_data_variable="r_df", input_data_variable="r_df") -%}
+{%- if fields %}
+# 将固定效应变量转换为因子变量
+{% for fe in fields -%}
+{{ output_data_variable }}${{ fe }} <- as.factor({{ input_data_variable }}${{ fe }})
+{% endfor %}
+{%- endif %}
+{%- endmacro %}
+
+{% macro set_panel(set_panel_fields, output_data_variable="r_df", input_data_variable="r_df") -%}
+{{output_data_variable}} <- pdata.frame({{input_data_variable}}, index = c("{{set_panel_fields.entity}}", "{{set_panel_fields.time}}"))
+{%- endmacro %}
+
+{% macro clean_sample(fields=[], input_data_variable="r_df", output_data_variable="r_df") -%}
+# 删除在指定列中包含 NA 的行，但保留所有列
+specified_columns <- c({% for field in fields %}"{{ field }}"{% if not loop.last %}, {% endif %}{% endfor %})
+
+rows_ok <- stats::complete.cases({{ input_data_variable }}[, specified_columns, drop = FALSE])
+{{ output_data_variable }} <- {{ input_data_variable }}[rows_ok, , drop = FALSE]
+{%- endmacro %}
+
+{% macro winsorize(winsorize_percent=0.05, winsorize_fields=[], input_data_variable="r_df", output_data_variable="r_df") %}
+# 指定需要 Winsorize 处理的列
+winsorize_columns <- c("{{ winsorize_fields | join('", "') }}")
+
+# 对 winsorize_columns 进行 Winsorize 处理
+{{ output_data_variable }}[winsorize_columns] <- lapply({{ input_data_variable }}[winsorize_columns], function(x) {
+  if (is.numeric(x)) {
+    Winsorize(x, val = quantile(x, probs = c({{ winsorize_percent }}, {{ 1 - winsorize_percent }}), na.rm = TRUE)) # 限制上下 {{ winsorize_percent * 100 }}% 分位数
+  } else {
+    x  # 保持非数值列不变
+  }
+})
+{% endmacro %}
+
+
+{% macro OLS(regression_model, include_opposite=False, output_data_variable="ols_result", input_data_variable="r_df") -%}
+{# ---------- 子集条件（与原逻辑一致） ---------- #}
+#----------------{{regression_model.name}}----------------#
+{% if regression_model.classification_field and regression_model.classification_conditions and regression_model.operator -%}
+  {% set subset_condition = '(' ~ regression_model.classification_field ~ ' ' ~ regression_model.operator ~ ' ' ~ regression_model.classification_conditions ~ ')' %}
+  {% set subset_statement = ', subset = ' ~ subset_condition %}
+  {% set not_subset_condition = '(!' ~ subset_condition ~ ')' %}
+  {% set not_subset_statement = ', subset = ' ~ not_subset_condition %}
+{% endif -%}
+
+{# ---------- 组装 RHS：X、controls、category_controls=factor(...)（与原逻辑一致） ---------- #}
+{% set rhs = regression_model.X | join(' + ') -%}
+{% if regression_model.controls -%}
+  {% set rhs = rhs ~ ' + ' ~ (regression_model.controls | join(' + ')) -%}
+{% endif -%}
+{% if regression_model.category_controls -%}
+  {% set rhs = rhs ~ ' + factor(' ~ (regression_model.category_controls | map('string') | join(') + factor(')) ~ ')' -%}
+{% endif -%}
+
+{# ---------- (1) 正向子集回归：仅输出执行代码 ---------- #}
+reg_{{ output_data_variable }} <- stats::lm({{ regression_model.y }} ~ {{ rhs }}, data = {{ input_data_variable }}{% if subset_statement %} {{ subset_statement }}{% endif %})
+
+{# ---------- (2) 反向子集回归（受 include_opposite 控制） ---------- #}
+{% if include_opposite and (regression_model.classification_field and regression_model.classification_conditions and regression_model.operator) -%}
+reg_{{ output_data_variable }}_opposite <- stats::lm({{ regression_model.y }} ~ {{ rhs }}, data = {{ input_data_variable }}{{ not_subset_statement }})
+{% endif -%}
+{%- endmacro %}
+
+{# 只输出 FE(plm, within) 回归执行代码；拼装逻辑与原模板一致 + 扩展 OLS/1-way/2-way 判定 #}
+{% macro plm(regression_model, include_opposite=False, output_data_variable="fe_result", input_data_variable="r_df") -%}
+{# ---------- 子集条件（与原逻辑一致） ---------- #}
+{% if regression_model.classification_field and regression_model.classification_conditions and regression_model.operator -%}
+  {% set subset_condition = '(' ~ regression_model.classification_field ~ ' ' ~ regression_model.operator ~ ' ' ~ regression_model.classification_conditions ~ ')' %}
+  {% set subset_statement = ', subset = ' ~ subset_condition %}
+  {% set not_subset_condition = '(!' ~ subset_condition ~ ')' %}
+  {% set not_subset_statement = ', subset = ' ~ not_subset_condition %}
+{% endif -%}
+
+{# ---------- 组装 RHS：X、controls、category_controls=factor(...)（与原逻辑一致） ---------- #}
+{% set rhs = regression_model.X | join(' + ') -%}
+{% if regression_model.controls -%}
+  {% set rhs = rhs ~ ' + ' ~ (regression_model.controls | join(' + ')) -%}
+{% endif -%}
+{% if regression_model.category_controls -%}
+  {% set rhs = rhs ~ ' + factor(' ~ (regression_model.category_controls | map('string') | join(') + factor(')) ~ ')' -%}
+{% endif -%}
+
+{# ---------- 新增：依据你的规则推导 model/effect（不改原入参/拼装方式） ---------- #}
+{# 模型输入（缺省或非常规时按 FE 处理，保持原行为） #}
+{% set _model_in = (regression_model.model|string|lower) if regression_model.model is defined else 'fe' %}
+
+{# 面板索引（兼容 entity/id/individual 与 time/year 命名），统一小写 #}
+{% set _pid = regression_model.panel_ids if regression_model.panel_ids is defined else {} %}
+{% set _id   = (_pid.entity or _pid.id or _pid.individual) if _pid else None %}
+{% set _time = (_pid.time   or _pid.year or _pid.t)        if _pid else None %}
+{% set _id_l   = (_id|string|lower)   if _id   is not none else '' %}
+{% set _time_l = (_time|string|lower) if _time is not none else '' %}
+
+{# 固定效应变量列表 = fixed_effects ∪ category_controls（名称小写化）#}
+{% set _fe_raw = regression_model.fixed_effects if regression_model.fixed_effects is defined else None %}
+{% if _fe_raw is sameas(true) %}
+  {% set _fe_fixed = [] %}
+{% elif _fe_raw is sameas(false) or _fe_raw is none %}
+  {% set _fe_fixed = [] %}
+{% elif _fe_raw is string %}
+  {% set _fe_fixed = [_fe_raw] %}
+{% else %}
+  {% set _fe_fixed = _fe_raw %}
+{% endif %}
+{% set _fe_fixed_l = _fe_fixed | map('string') | map('lower') | list %}
+{% set _cats_l = (regression_model.category_controls or []) | map('string') | map('lower') | list %}
+{% set _fe_set = (_fe_fixed_l + _cats_l) | unique %}
+
+{# 判定 effect：time 独占→time；id 独占→individual；其余（无/全重合/信息不足）→twoways #}
+{% set _id_match   = (_id_l in _fe_set) %}
+{% set _time_match = (_time_l in _fe_set) %}
+
+{% if _model_in == 'ols' or _model_in == 'pooling' %}
+  {% set _model_arg = 'pooling' %}
+  {% set _effect_arg = none %}
+{% else %}
+  {% set _model_arg = 'within' %}
+  {% if _time_match and not _id_match %}
+    {% set _effect_arg = 'time' %}
+  {% elif _id_match and not _time_match %}
+    {% set _effect_arg = 'individual' %}
+  {% else %}
+    {% set _effect_arg = 'twoways' %}
+  {% endif %}
+{% endif %}
+
+{# ---------- (1) 正向子集回归：按推导结果生成 plm 调用 ---------- #}
+{% if _model_arg == 'pooling' %}
+reg_{{ output_data_variable }} <- plm({{ regression_model.y }} ~ {{ rhs }}, data = {{ input_data_variable }}, model = "pooling"{% if subset_statement %} {{ subset_statement }}{% endif %})
+{% else %}
+  {% if _effect_arg in ['individual','time','twoways'] %}
+reg_{{ output_data_variable }} <- plm({{ regression_model.y }} ~ {{ rhs }}, data = {{ input_data_variable }}, model = "within", effect = "{{ _effect_arg }}"{% if subset_statement %} {{ subset_statement }}{% endif %})
+  {% else %}
+reg_{{ output_data_variable }} <- plm({{ regression_model.y }} ~ {{ rhs }}, data = {{ input_data_variable }}, model = "within"{% if subset_statement %} {{ subset_statement }}{% endif %})
+  {% endif %}
+{% endif %}
+
+{# ---------- (2) 反向子集回归（与你原逻辑一致，按 include_opposite 控制） ---------- #}
+{% if include_opposite and (regression_model.classification_field and regression_model.classification_conditions and regression_model.operator) -%}
+  {% if _model_arg == 'pooling' %}
+reg_{{ output_data_variable }}_opposite <- plm({{ regression_model.y }} ~ {{ rhs }}, data = {{ input_data_variable }}, model = "pooling"{{ not_subset_statement }})
+  {% else %}
+    {% if _effect_arg in ['individual','time','twoways'] %}
+reg_{{ output_data_variable }}_opposite <- plm({{ regression_model.y }} ~ {{ rhs }}, data = {{ input_data_variable }}, model = "within", effect = "{{ _effect_arg }}"{{ not_subset_statement }})
+    {% else %}
+reg_{{ output_data_variable }}_opposite <- plm({{ regression_model.y }} ~ {{ rhs }}, data = {{ input_data_variable }}, model = "within"{{ not_subset_statement }})
+    {% endif %}
+  {% endif %}
+{% endif -%}
+{%- endmacro %}

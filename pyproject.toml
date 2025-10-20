@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "regression_monkey"
+version = "0.1.0"
+description = "Reproducible regression workflow: loaders → dependency tracking → codegen → execution."
+readme = {file = "README.md", content-type = "text/markdown"}
+requires-python = ">=3.9"
+license = {file = "LICENSE"}
+authors = [{name="Your Name", email="you@example.com"}]
+keywords = ["econometrics","regression","reproducibility","rpy2","jinja2","arcticdb"]
+
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Scientific/Engineering :: Information Analysis"
+]
+
+dependencies = [
+  "pandas>=2.0",
+  "numpy>=1.24",
+  "jinja2>=3.1",
+  # rpy2 is optional; skip on Windows by default to reduce friction.
+  "rpy2>=3.5; platform_system != 'Windows'",
+  "pyyaml>=6.0"
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "black>=24.0", "ruff>=0.5", "build>=1.2.1", "twine>=5.0"]
+full = ["arcticdb>=4.5"]
+
+[project.urls]
+Homepage = "https://example.com/regmonkey"
+Repository = "https://example.com/regmonkey"
+Issues = "https://example.com/regmonkey/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+reg_monkey = ["*.jinja"]
+
+[tool.black]
+line-length = 100
+
+[tool.ruff]
+line-length = 100
