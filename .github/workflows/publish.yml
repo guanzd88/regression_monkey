@@ -1,25 +1,77 @@
-name: Publish to PyPI
+name: Publish to PyPI (OIDC)
 
 on:
   release:
     types: [published]
+  # 或者改成按 tag 触发：
+  # push:
+  #   tags: ['v*']
 
 permissions:
-  id-token: write   
+  id-token: write
   contents: read
 
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write   
+      id-token: write
       contents: read
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: python -m pip install -U build twine
-      - run: python -m build
-      - name: Publish to PyPI
+
+      # 0) 打印一下当前提交，确保是你预期的版本
+      - name: Show commit
+        run: |
+          git log -1 --decorate --oneline
+          git status -s
+
+      # 1) 彻底清理旧产物（极其关键）
+      - name: Clean old builds
+        run: rm -rf dist build *.egg-info
+
+      # 2) 构建并在 CI 内先自检（如果有问题这里就会 fail）
+      - name: Build sdist+wheel
+        run: |
+          python -m pip install -U build twine
+          python -m build
+          python -m twine check dist/*
+
+      # 3) 诊断 A：列出 dist，确认确实是新文件
+      - name: List dist
+        run: |
+          ls -l dist
+          (shasum -a 256 dist/* || sha256sum dist/*)
+
+      # 4) 诊断 B：检查 wheel 内部有没有 METADATA
+      - name: Inspect wheel structure
+        run: |
+          python - <<'PY'
+          import glob, zipfile
+          w = sorted(glob.glob('dist/*.whl'))[-1]
+          print("Wheel:", w)
+          with zipfile.ZipFile(w) as z:
+              names = z.namelist()
+              meta = [n for n in names if n.endswith('dist-info/METADATA')]
+              print("Has METADATA:", bool(meta))
+              if meta:
+                  print("METADATA head:")
+                  print(z.read(meta[0]).decode().splitlines()[:10])
+              else:
+                  print("First 30 names in wheel:")
+                  print("\n".join(names[:30]))
+          PY
+
+      # 5) 诊断 C：确认 pyproject.toml 的 name/version（防止用错文件）
+      - name: Show pyproject excerpt
+        run: |
+          sed -n '1,120p' pyproject.toml | sed -n '1,120p' | sed -n '1,120p' | grep -E '^\[project\]|^name\s*=|^version\s*=' -n
+
+      # 6) 走 OIDC 发布（不要填 user/password）
+      - name: Publish to PyPI via OIDC
         uses: pypa/gh-action-pypi-publish@v1.10.3
+        # 空 with：即 OIDC 模式
