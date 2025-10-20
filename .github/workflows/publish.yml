@@ -73,5 +73,5 @@ jobs:
 
       # 6) 走 OIDC 发布（不要填 user/password）
       - name: Publish to PyPI via OIDC
-        uses: pypa/gh-action-pypi-publish@v1.10.3
+        uses: pypa/gh-action-pypi-publish@release/v1
         # 空 with：即 OIDC 模式
