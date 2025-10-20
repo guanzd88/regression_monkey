@@ -1,42 +1,67 @@
-- name: Clean old builds
-run: rm -rf dist build *.egg-info
+name: Publish to PyPI
 
-- name: Build sdist+wheel
-run: |
-  python -m pip install -U build twine
-  python -m build
-  python -m twine check dist/*
+on:
+  release:
+    types: [published]
 
-# 诊断1：列出 dist 内容
-- name: List dist
-run: ls -l dist && shasum -a 256 dist/* || sha256sum dist/*
+permissions:
+  id-token: write     # 关键行！缺了它 OIDC 不会给 token
+  contents: read
 
-# 诊断2：解包 wheel 看是否存在 dist-info/METADATA
-- name: Inspect wheel structure
-run: |
-  python - <<'PY'
-  import glob, zipfile, sys
-  w = sorted(glob.glob('dist/*.whl'))[-1]
-  print("Wheel:", w)
-  with zipfile.ZipFile(w) as z:
-      names = z.namelist()
-      meta = [n for n in names if n.endswith('dist-info/METADATA')]
-      print("Has METADATA:", bool(meta))
-      if meta:
-          print("METADATA head:")
-          print(z.read(meta[0]).decode().splitlines()[:8])
-      else:
-          print("Wheel file structure (first 30):")
-          print("\n".join(names[:30]))
-  PY
-
-# 诊断3：把 METADATA 打印到日志（再次确认 Name/Version）
-- name: Show METADATA header (debug)
-run: |
-  python - <<'PY'
-  import glob, zipfile
-  w = sorted(glob.glob('dist/*.whl'))[-1]
-  with zipfile.ZipFile(w) as z:
-      meta = [n for n in z.namelist() if n.endswith('METADATA')][0]
-      print(z.read(meta).decode().splitlines()[:12])
-  PY
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write     # 关键行！缺了它 OIDC 不会给 token
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -U build twine
+      - run: python -m build
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.10.3
+      - name: Clean old builds
+        run: rm -rf dist build *.egg-info
+      
+      - name: Build sdist+wheel
+        run: |
+          python -m pip install -U build twine
+          python -m build
+          python -m twine check dist/*
+      
+      # 诊断1：列出 dist 内容
+      - name: List dist
+        run: ls -l dist && shasum -a 256 dist/* || sha256sum dist/*
+      
+      # 诊断2：解包 wheel 看是否存在 dist-info/METADATA
+      - name: Inspect wheel structure
+        run: |
+          python - <<'PY'
+          import glob, zipfile, sys
+          w = sorted(glob.glob('dist/*.whl'))[-1]
+          print("Wheel:", w)
+          with zipfile.ZipFile(w) as z:
+              names = z.namelist()
+              meta = [n for n in names if n.endswith('dist-info/METADATA')]
+              print("Has METADATA:", bool(meta))
+              if meta:
+                  print("METADATA head:")
+                  print(z.read(meta[0]).decode().splitlines()[:8])
+              else:
+                  print("Wheel file structure (first 30):")
+                  print("\n".join(names[:30]))
+          PY
+      
+      # 诊断3：把 METADATA 打印到日志（再次确认 Name/Version）
+      - name: Show METADATA header (debug)
+        run: |
+          python - <<'PY'
+          import glob, zipfile
+          w = sorted(glob.glob('dist/*.whl'))[-1]
+          with zipfile.ZipFile(w) as z:
+              meta = [n for n in z.namelist() if n.endswith('METADATA')][0]
+              print(z.read(meta).decode().splitlines()[:12])
+          PY
