@@ -91,23 +91,28 @@ res = executor.run_script_text(code)   # 返回标准化的结果字典/表
 - **预算与交互**：基于历史耗时估算链路成本；可设阈值区分“自动/需确认”的策略。
 - **标准化结果**：把多模型的输出（系数、稳健性、PSM、Heckman 等）统一为结构化表格，便于对比/制表。
 
-## 目录结构（建议）
+## 项目目录结构（建议）
 
 ```
-regmonkey/
-├─ pyproject.toml
-├─ README.md
-└─ src/
-   └─ regmonkey/
-      ├─ __init__.py
-      ├─ data_loader.py
-      ├─ data_manager.py
-      ├─ task_obj.py
-      ├─ code_generator.py
-      ├─ code_executor.py
-      ├─ planner.py
-      ├─ util.py
-      └─ r_template.jinja
+├── config.json （项目配置文件）
+├── data (存放arcticdb数据文件，自动生成无需手工建立)
+├── data_loader
+│   ├── A.py
+│   ├── B1.py
+│   ├── B2.py
+│   ├── C.py
+│   ├── D.py
+│   ├── fuck.py
+│   ├── performance.py
+├── source_data （存放原始数据，必须以pkl格式存储）
+│   ├── 185.pkl
+│   ├── 286.pkl
+│   ├── A.pkl
+│   ├── B1.pkl
+│   ├── B2.pkl
+│   ├── C.pkl
+│   └── D.pkl
+├── main.py
 ```
 
 ## 配置
