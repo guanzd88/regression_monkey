@@ -991,26 +991,8 @@ class DataManager:
     def describe_arctic(self, data_dir: Optional[str] = None, max_cols: int = 10) -> str:
         """
         描述当前目录（LMDB）的 ArcticDB 内容，返回一段可读字符串。
-        输出风格与字段基本对齐 check_arcticdb.py：
-          - 列出库（libraries）
-          - 对每个库遍历 symbol
-          - 对每个 symbol 显示：
-              versions（数量与最新版本号）、latest_written（最新版本创建时间）、
-              shape、columns（前 max_cols 个）、metadata keys
-
-        参数
-        ----
-        data_dir : str | None
-            Arctic LMDB 目录；默认使用 self.arctic_local_dir（通常是 ./data）。
-        max_cols : int
-            columns 预览列数上限，默认 10。
-
-        返回
-        ----
-        str
-            可直接打印的人类可读文本。
+        注意：同一进程内不可对同一 LMDB 路径创建多个 Arctic 实例。
         """
-        import sys
         from datetime import datetime
 
         def _safe_iso(ts):
@@ -1023,28 +1005,68 @@ class DataManager:
             except Exception:
                 return "-"
 
-        data_dir = data_dir or getattr(self, "arctic_local_dir", os.path.join(os.getcwd(), "data"))
-        lines = []
-        if not os.path.exists(data_dir):
-            return f"[ERR] data 目录不存在：{data_dir}"
+        # 规范化路径，避免 /a/b 与 /a/b/ 被认为不同
+        def _norm_path(p: str) -> str:
+            return os.path.normpath(os.path.abspath(p))
 
-        uri = f"lmdb://{data_dir}"
+        target_dir = data_dir or getattr(self, "arctic_local_dir", os.path.join(os.getcwd(), "data"))
+        target_dir_n = _norm_path(target_dir)
+
+        lines: List[str] = []
+        if not os.path.exists(target_dir):
+            return f"[ERR] data 目录不存在：{target_dir}"
+
+        uri = f"lmdb://{target_dir}"
         lines.append(f"[INFO] 连接 ArcticDB：{uri}")
+
+        # ✅ 优先复用：1) 当前实例已打开且路径一致
+        store = None
         try:
-            store = Arctic(uri)
-        except Exception as e:
-            return f"[ERR] 无法连接 ArcticDB：{uri}，原因：{e}"
+            cur_dir = getattr(self, "arctic_local_dir", None)
+            if cur_dir and _norm_path(cur_dir) == target_dir_n and getattr(self, "store", None) is not None:
+                store = self.store
+        except Exception:
+            store = None
+
+        # ✅ 复用：2) DataManager 进程级缓存里已有该路径
+        if store is None:
+            try:
+                for k, v in DataManager._ARCTIC_CACHE.items():
+                    if _norm_path(k) == target_dir_n:
+                        store = v
+                        break
+            except Exception:
+                store = None
+
+        # ⚠️ 最后才尝试新建（仅当该路径在本进程未打开过）
+        created_here = False
+        if store is None:
+            try:
+                store = Arctic(uri)
+                created_here = True
+            except Exception as e:
+                out = "\n".join(lines + [f"[ERR] 无法连接 ArcticDB：{uri}，原因：{e}"])
+                print(out)
+                return out
 
         # 列出库
         try:
             libraries = list(store.list_libraries())
-        except Exception:
-            lines.append("[WARN] 无法列出库（list_libraries 失败），请确认库名。")
+        except Exception as e:
+            lines.append(f"[WARN] 无法列出库（list_libraries 失败）：{e}")
             libraries = []
 
         if not libraries:
-            lines.append("[INFO] 未检测到库。你可以把库名填进 LIB_NAME 变量重试。")
-            return "\n".join(lines)
+            lines.append("[INFO] 未检测到库。请确认库是否已创建，以及当前进程未重复打开同一路径。")
+            if created_here:
+                try:
+                    if hasattr(store, "close"):
+                        store.close()
+                except Exception:
+                    pass
+            out = "\n".join(lines)
+            print(out)
+            return out
 
         for lib_name in libraries:
             lines.append(f"\n=== Library: {lib_name} ===")
@@ -1078,8 +1100,7 @@ class DataManager:
                         last_version_id = None
                         last_created_at = None
 
-                    # 最新数据与元数据
-                    item = lib.read(sym)  # 最新版本
+                    item = lib.read(sym)
                     df = item.data
                     meta = dict(item.metadata or {})
 
@@ -1093,16 +1114,22 @@ class DataManager:
                     lines.append(f"    latest_written: {_safe_iso(last_created_at)}")
                     lines.append(f"    shape         : {shape}")
                     lines.append(f"    columns       : {cols_preview}{tail}")
-                    if meta:
-                        lines.append(f"    metadata keys : {list(meta.keys())}")
-                    else:
-                        lines.append(f"    metadata      : {{}}")
+                    lines.append(f"    metadata keys : {list(meta.keys())}" if meta else f"    metadata      : {{}}")
 
                 except Exception as e:
-                    # 与 check_arcticdb.py 一致：遇错也继续下一个 symbol
                     lines.append(f"  [ERR] 读取 symbol '{sym}' 失败：{e}")
-        print("\n".join(lines))
-        return "\n".join(lines)
+
+        # 如果是本函数新建的 store，尽力关闭；复用的不要关（交给引用计数/持有者）
+        if created_here:
+            try:
+                if hasattr(store, "close"):
+                    store.close()
+            except Exception:
+                pass
+
+        out = "\n".join(lines)
+        print(out)
+        return out
 
 
 

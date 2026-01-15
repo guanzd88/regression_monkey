@@ -1,4 +1,3 @@
-__version__ = "0.1.0"
 from .data_loader import DataLoader
 from .data_manager import DataManager
 from .task_obj import StandardRegTask

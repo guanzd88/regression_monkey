@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "regression_monkey"
-version = "0.1.0"
+version = "0.1.1"
 description = "Reproducible regression workflow: loaders → dependency tracking → codegen → execution."
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.9"
@@ -33,7 +33,8 @@ dependencies = [
   "jinja2>=3.1",
   # rpy2 is optional; skip on Windows by default to reduce friction.
   "rpy2>=3.5; platform_system != 'Windows'",
-  "pyyaml>=6.0"
+  "pyyaml>=6.0",
+  "arcticdb>=6.2.3"
 ]
 
 [project.optional-dependencies]
