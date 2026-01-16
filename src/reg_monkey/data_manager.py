@@ -501,8 +501,6 @@ class DataManager:
 
         return injected_attrs
 
-
-
     # ------------------------------ 加载优先级 -------------------------------
     def _resolve_priority(self, symbol: str, forced_set: Set[str]) -> List[str]:
         default = ["arctic", "dataloader", "pkl"]
@@ -520,91 +518,86 @@ class DataManager:
         errors: List[Tuple[str, str]] = []
 
         for src in order:
-            try:
-                if src == "arctic":
-                    if self._symbol_exists(symbol):
-                        df = self._read_df(symbol)  # 内部已走安全名
-                        # 双键写入：真实名 / 安全属性名 / 安全持久化名
+            if src == "arctic":
+                if self._symbol_exists(symbol):
+                    df = self._read_df(symbol)  # 内部已走安全名
+                    # 双键写入：真实名 / 安全属性名 / 安全持久化名
+                    self.loaded_data[symbol] = df
+                    self.loaded_data[self._canonical_attr(symbol)] = df
+                    self.loaded_data[self._canonical_symbol(symbol)] = df
+                    print(f"[Load] {self._canonical_symbol(symbol)} <- Arctic")
+                    return df
+
+            elif src == "dataloader":
+                path = os.path.join(self.data_loader_folder, f"{symbol}.py")
+                if os.path.exists(path):
+                    deps = graph.get(symbol, [])
+                    sem_hash = self._compute_semantic_hash(path, deps)
+                    dl = self._dynamic_import_loader(path)
+                    if not hasattr(dl, 'clean_data'):
+                        raise AttributeError(f"DataLoader for symbol '{symbol}' has no clean_data()")
+
+                    # 注入依赖
+                    injected_attrs = self._inject_dependencies(dl, symbol, graph, forced_set)
+
+                    # 执行 clean_data：接住返回值并回填 dl.df
+                    t0 = time.time()
+                    ret = dl.clean_data()
+                    cost = time.time() - t0
+                    if ret is not None:
+                        if not isinstance(ret, pd.DataFrame):
+                            raise TypeError(f"clean_data() must return a pandas.DataFrame or None, got {type(ret)}")
+                        dl.df = ret
+                    if not hasattr(dl, 'df') or dl.df is None:
+                        raise AttributeError(f"DataLoader for symbol '{symbol}' produced no df")
+
+                    # 写入 Arctic（安全名）
+                    meta = {
+                        'semantic_hash': sem_hash,
+                        'runtime_seconds': float(cost),
+                        'dependencies': deps,
+                        'injected_attrs': injected_attrs,
+                        'data_source': 'dataloader',
+                        'forced': symbol in forced_set,
+                        'trigger_reason': 'manual' if symbol in self.force_refresh_symbols_cfg else 'hash_changed',
+                        'run_at': datetime.utcnow().isoformat() + 'Z',
+                    }
+                    self._write_df(symbol, dl.df, metadata=meta)  # 内部转安全名
+                    # 双键写入缓存
+                    self.loaded_data[symbol] = dl.df
+                    self.loaded_data[self._canonical_attr(symbol)] = dl.df
+                    self.loaded_data[self._canonical_symbol(symbol)] = dl.df
+                    print(f"[Build] {self._canonical_symbol(symbol)} via DataLoader, {cost:.2f}s -> Arctic (deps→{injected_attrs})")
+                    return dl.df
+
+            elif src == "pkl":
+                pkl_name = symbol if symbol.endswith('.pkl') else f"{symbol}.pkl"
+                pkl_path = os.path.join(self.project_path, 'source_data', pkl_name)
+                if os.path.exists(pkl_path):
+                    df = self._load_pkl_compat(pkl_path)
+                    if df is not None:
+                        # 双键写入缓存
                         self.loaded_data[symbol] = df
                         self.loaded_data[self._canonical_attr(symbol)] = df
                         self.loaded_data[self._canonical_symbol(symbol)] = df
-                        print(f"[Load] {self._canonical_symbol(symbol)} <- Arctic")
+                        print(f"[Load] {self._canonical_symbol(symbol)} <- PKL: {pkl_path}")
+
+                        # 可选：把 PKL 写回 Arctic（安全名）
+                        if self.ingest_pkl_on_load:
+                            meta = {
+                                'data_source': 'pkl',
+                                'ingested_from': 'pkl',
+                                'runtime_seconds': 0.0,
+                                'dependencies': [],
+                                'trigger_reason': 'ingest_pkl',
+                                'run_at': datetime.utcnow().isoformat() + 'Z',
+                            }
+                            try:
+                                self._write_df(symbol, df, metadata=meta)  # 内部转安全名
+                                print(f"[Ingest] {self._canonical_symbol(symbol)} (from PKL) -> Arctic")
+                            except Exception as e:
+                                print(f"[Warn] 写回 Arctic 失败（PKL→Arctic）：{symbol}: {e}")
                         return df
-
-                elif src == "dataloader":
-                    path = os.path.join(self.data_loader_folder, f"{symbol}.py")
-                    if os.path.exists(path):
-                        deps = graph.get(symbol, [])
-                        sem_hash = self._compute_semantic_hash(path, deps)
-                        dl = self._dynamic_import_loader(path)
-                        if not hasattr(dl, 'clean_data'):
-                            raise AttributeError(f"DataLoader for symbol '{symbol}' has no clean_data()")
-
-                        # 注入依赖
-                        injected_attrs = self._inject_dependencies(dl, symbol, graph, forced_set)
-
-                        # 执行 clean_data：接住返回值并回填 dl.df
-                        t0 = time.time()
-                        ret = dl.clean_data()
-                        cost = time.time() - t0
-                        if ret is not None:
-                            if not isinstance(ret, pd.DataFrame):
-                                raise TypeError(f"clean_data() must return a pandas.DataFrame or None, got {type(ret)}")
-                            dl.df = ret
-                        if not hasattr(dl, 'df') or dl.df is None:
-                            raise AttributeError(f"DataLoader for symbol '{symbol}' produced no df")
-
-                        # 写入 Arctic（安全名）
-                        meta = {
-                            'semantic_hash': sem_hash,
-                            'runtime_seconds': float(cost),
-                            'dependencies': deps,
-                            'injected_attrs': injected_attrs,
-                            'data_source': 'dataloader',
-                            'forced': symbol in forced_set,
-                            'trigger_reason': 'manual' if symbol in self.force_refresh_symbols_cfg else 'hash_changed',
-                            'run_at': datetime.utcnow().isoformat() + 'Z',
-                        }
-                        self._write_df(symbol, dl.df, metadata=meta)  # 内部转安全名
-                        # 双键写入缓存
-                        self.loaded_data[symbol] = dl.df
-                        self.loaded_data[self._canonical_attr(symbol)] = dl.df
-                        self.loaded_data[self._canonical_symbol(symbol)] = dl.df
-                        print(f"[Build] {self._canonical_symbol(symbol)} via DataLoader, {cost:.2f}s -> Arctic (deps→{injected_attrs})")
-                        return dl.df
-
-                elif src == "pkl":
-                    pkl_name = symbol if symbol.endswith('.pkl') else f"{symbol}.pkl"
-                    pkl_path = os.path.join(self.project_path, 'source_data', pkl_name)
-                    if os.path.exists(pkl_path):
-                        df = self._load_pkl_compat(pkl_path)
-                        if df is not None:
-                            # 双键写入缓存
-                            self.loaded_data[symbol] = df
-                            self.loaded_data[self._canonical_attr(symbol)] = df
-                            self.loaded_data[self._canonical_symbol(symbol)] = df
-                            print(f"[Load] {self._canonical_symbol(symbol)} <- PKL: {pkl_path}")
-
-                            # 可选：把 PKL 写回 Arctic（安全名）
-                            if self.ingest_pkl_on_load:
-                                meta = {
-                                    'data_source': 'pkl',
-                                    'ingested_from': 'pkl',
-                                    'runtime_seconds': 0.0,
-                                    'dependencies': [],
-                                    'trigger_reason': 'ingest_pkl',
-                                    'run_at': datetime.utcnow().isoformat() + 'Z',
-                                }
-                                try:
-                                    self._write_df(symbol, df, metadata=meta)  # 内部转安全名
-                                    print(f"[Ingest] {self._canonical_symbol(symbol)} (from PKL) -> Arctic")
-                                except Exception as e:
-                                    print(f"[Warn] 写回 Arctic 失败（PKL→Arctic）：{symbol}: {e}")
-                            return df
-
-            except Exception as e:
-                errors.append((src, str(e)))
-                continue
 
         raise RuntimeError(f"未找到或无法加载同名数据集：symbol={symbol}; attempts={order}; errors={errors}")
 
@@ -792,10 +785,7 @@ class DataManager:
         # 8) 执行 / 只读装载
         if do_run:
             for s in topo_chain:
-                try:
-                    self._load_symbol(s, F, graph)
-                except Exception as e:
-                    print(f"[Warn] 加载 {s} 失败：{e}")
+                self._load_symbol(s, F, graph)
         else:
             # ⚠️ 只加载“目标本体”，不加载其依赖，避免不必要的内存占用
             for s in self.target_symbols:
@@ -991,26 +981,8 @@ class DataManager:
     def describe_arctic(self, data_dir: Optional[str] = None, max_cols: int = 10) -> str:
         """
         描述当前目录（LMDB）的 ArcticDB 内容，返回一段可读字符串。
-        输出风格与字段基本对齐 check_arcticdb.py：
-          - 列出库（libraries）
-          - 对每个库遍历 symbol
-          - 对每个 symbol 显示：
-              versions（数量与最新版本号）、latest_written（最新版本创建时间）、
-              shape、columns（前 max_cols 个）、metadata keys
-
-        参数
-        ----
-        data_dir : str | None
-            Arctic LMDB 目录；默认使用 self.arctic_local_dir（通常是 ./data）。
-        max_cols : int
-            columns 预览列数上限，默认 10。
-
-        返回
-        ----
-        str
-            可直接打印的人类可读文本。
+        注意：同一进程内不可对同一 LMDB 路径创建多个 Arctic 实例。
         """
-        import sys
         from datetime import datetime
 
         def _safe_iso(ts):
@@ -1023,28 +995,68 @@ class DataManager:
             except Exception:
                 return "-"
 
-        data_dir = data_dir or getattr(self, "arctic_local_dir", os.path.join(os.getcwd(), "data"))
-        lines = []
-        if not os.path.exists(data_dir):
-            return f"[ERR] data 目录不存在：{data_dir}"
+        # 规范化路径，避免 /a/b 与 /a/b/ 被认为不同
+        def _norm_path(p: str) -> str:
+            return os.path.normpath(os.path.abspath(p))
 
-        uri = f"lmdb://{data_dir}"
+        target_dir = data_dir or getattr(self, "arctic_local_dir", os.path.join(os.getcwd(), "data"))
+        target_dir_n = _norm_path(target_dir)
+
+        lines: List[str] = []
+        if not os.path.exists(target_dir):
+            return f"[ERR] data 目录不存在：{target_dir}"
+
+        uri = f"lmdb://{target_dir}"
         lines.append(f"[INFO] 连接 ArcticDB：{uri}")
+
+        # ✅ 优先复用：1) 当前实例已打开且路径一致
+        store = None
         try:
-            store = Arctic(uri)
-        except Exception as e:
-            return f"[ERR] 无法连接 ArcticDB：{uri}，原因：{e}"
+            cur_dir = getattr(self, "arctic_local_dir", None)
+            if cur_dir and _norm_path(cur_dir) == target_dir_n and getattr(self, "store", None) is not None:
+                store = self.store
+        except Exception:
+            store = None
+
+        # ✅ 复用：2) DataManager 进程级缓存里已有该路径
+        if store is None:
+            try:
+                for k, v in DataManager._ARCTIC_CACHE.items():
+                    if _norm_path(k) == target_dir_n:
+                        store = v
+                        break
+            except Exception:
+                store = None
+
+        # ⚠️ 最后才尝试新建（仅当该路径在本进程未打开过）
+        created_here = False
+        if store is None:
+            try:
+                store = Arctic(uri)
+                created_here = True
+            except Exception as e:
+                out = "\n".join(lines + [f"[ERR] 无法连接 ArcticDB：{uri}，原因：{e}"])
+                print(out)
+                return out
 
         # 列出库
         try:
             libraries = list(store.list_libraries())
-        except Exception:
-            lines.append("[WARN] 无法列出库（list_libraries 失败），请确认库名。")
+        except Exception as e:
+            lines.append(f"[WARN] 无法列出库（list_libraries 失败）：{e}")
             libraries = []
 
         if not libraries:
-            lines.append("[INFO] 未检测到库。你可以把库名填进 LIB_NAME 变量重试。")
-            return "\n".join(lines)
+            lines.append("[INFO] 未检测到库。请确认库是否已创建，以及当前进程未重复打开同一路径。")
+            if created_here:
+                try:
+                    if hasattr(store, "close"):
+                        store.close()
+                except Exception:
+                    pass
+            out = "\n".join(lines)
+            print(out)
+            return out
 
         for lib_name in libraries:
             lines.append(f"\n=== Library: {lib_name} ===")
@@ -1078,8 +1090,7 @@ class DataManager:
                         last_version_id = None
                         last_created_at = None
 
-                    # 最新数据与元数据
-                    item = lib.read(sym)  # 最新版本
+                    item = lib.read(sym)
                     df = item.data
                     meta = dict(item.metadata or {})
 
@@ -1093,16 +1104,22 @@ class DataManager:
                     lines.append(f"    latest_written: {_safe_iso(last_created_at)}")
                     lines.append(f"    shape         : {shape}")
                     lines.append(f"    columns       : {cols_preview}{tail}")
-                    if meta:
-                        lines.append(f"    metadata keys : {list(meta.keys())}")
-                    else:
-                        lines.append(f"    metadata      : {{}}")
+                    lines.append(f"    metadata keys : {list(meta.keys())}" if meta else f"    metadata      : {{}}")
 
                 except Exception as e:
-                    # 与 check_arcticdb.py 一致：遇错也继续下一个 symbol
                     lines.append(f"  [ERR] 读取 symbol '{sym}' 失败：{e}")
-        print("\n".join(lines))
-        return "\n".join(lines)
+
+        # 如果是本函数新建的 store，尽力关闭；复用的不要关（交给引用计数/持有者）
+        if created_here:
+            try:
+                if hasattr(store, "close"):
+                    store.close()
+            except Exception:
+                pass
+
+        out = "\n".join(lines)
+        print(out)
+        return out
 
 
 
