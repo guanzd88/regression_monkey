@@ -10,7 +10,6 @@ for (pkg in required_packages) {
   } else {
     utils::install.packages(pkg,
       dependencies = c("Depends","Imports","LinkingTo"),
-      type = "binary",                    # 有二进制就用
       Ncpus = max(1, parallel::detectCores()-1),
       quiet = TRUE
     )
@@ -20,6 +19,7 @@ for (pkg in required_packages) {
 {%- endmacro %}
 
 {% macro extract_coefficients() -%}
+# ---- rm_helper_start ----
 extract_coefficients_OLS <- function(fit) {
   tryCatch({
     if (is.null(fit) || !inherits(fit, "lm")) {
@@ -187,11 +187,164 @@ extract_coefficients_plm <- function(fit) {
   })
 }
 
+# ---- Fama-MacBeth helper (inlined) ----
+fmb_two_pass <- function(data,
+                         ts_formula,
+                         identity,
+                         time,
+                         nw_lag = NULL,
+                         t_type = c("NW", "Shanken"),
+                         shanken = TRUE,
+                         shanken_use_factors = NULL) {
+  t_type <- match.arg(t_type)
+  get_vars_from_formula <- function(fml) {
+    all.vars(fml)
+  }
+  nw_se_mean <- function(x, L) {
+    x <- as.numeric(x)
+    x <- x[is.finite(x)]
+    Tn <- length(x)
+    if (Tn < 2) return(NA_real_)
+    x <- x - mean(x)
+    gamma0 <- sum(x * x) / Tn
+    if (L <= 0) {
+      var_mean <- gamma0 / Tn
+      return(sqrt(var_mean))
+    }
+    gammas <- numeric(L)
+    for (k in 1:L) {
+      gammas[k] <- sum(x[(k + 1):Tn] * x[1:(Tn - k)]) / Tn
+    }
+    w <- 1 - (1:L) / (L + 1)
+    var_mean <- (gamma0 + 2 * sum(w * gammas)) / Tn
+    sqrt(var_mean)
+  }
+  default_nw_lag <- function(Tn) {
+    max(0L, as.integer(floor(4 * (Tn / 100)^(2/9))))
+  }
+  ts_vars <- get_vars_from_formula(ts_formula)
+  y_var <- ts_vars[1]
+  rhs_vars <- setdiff(ts_vars, y_var)
+  if (!is.null(shanken_use_factors)) {
+    factor_vars <- shanken_use_factors
+  } else {
+    factor_vars <- rhs_vars
+  }
+  needed_cols <- unique(c(identity, time, y_var, rhs_vars))
+  missing_cols <- setdiff(needed_cols, names(data))
+  if (length(missing_cols) > 0) {
+    stop("Missing columns in data: ", paste(missing_cols, collapse = ", "))
+  }
+  complete_idx <- stats::complete.cases(data[, needed_cols])
+  d <- data[complete_idx, , drop = FALSE]
+  d <- d[order(d[[time]]), , drop = FALSE]
+  ids <- unique(d[[identity]])
+  K <- length(rhs_vars)
+  beta_mat <- matrix(NA_real_, nrow = length(ids), ncol = K)
+  colnames(beta_mat) <- paste0("beta_", rhs_vars)
+  for (i in seq_along(ids)) {
+    sub <- d[d[[identity]] == ids[i], , drop = FALSE]
+    if (nrow(sub) < (K + 2)) next
+    fit <- stats::lm(ts_formula, data = sub)
+    b <- stats::coef(fit)
+    for (j in seq_along(rhs_vars)) {
+      nm <- rhs_vars[j]
+      beta_mat[i, j] <- if (nm %in% names(b)) unname(b[nm]) else NA_real_
+    }
+  }
+  beta_df <- data.frame(id__ = ids, beta_mat, stringsAsFactors = FALSE)
+  names(beta_df)[1] <- identity
+  d2 <- merge(d, beta_df, by = identity, all.x = TRUE, sort = FALSE)
+  beta_cols <- colnames(beta_mat)
+  d2 <- d2[stats::complete.cases(d2[, beta_cols, drop = FALSE]), , drop = FALSE]
+  times <- sort(unique(d2[[time]]))
+  Tn <- length(times)
+  if (Tn < 2) stop("Not enough time periods after cleaning to run FMB second stage.")
+  if (is.null(nw_lag)) nw_lag <- default_nw_lag(Tn)
+  cs_formula <- stats::as.formula(paste0(y_var, " ~ ", paste(beta_cols, collapse = " + ")))
+  lambda_ts <- matrix(NA_real_, nrow = Tn, ncol = length(beta_cols) + 1)
+  colnames(lambda_ts) <- c("(Intercept)", beta_cols)
+  r2_vec <- rep(NA_real_, Tn)
+  nobs_vec <- integer(Tn)
+  for (tix in seq_along(times)) {
+    tt <- times[tix]
+    sub <- d2[d2[[time]] == tt, , drop = FALSE]
+    if (nrow(sub) < (length(beta_cols) + 2)) next
+    fit_cs <- stats::lm(cs_formula, data = sub)
+    cf <- stats::coef(fit_cs)
+    for (nm in colnames(lambda_ts)) {
+      lambda_ts[tix, nm] <- if (nm %in% names(cf)) unname(cf[nm]) else NA_real_
+    }
+    r2_vec[tix] <- summary(fit_cs)$r.squared
+    nobs_vec[tix] <- nrow(sub)
+  }
+  ok_time <- apply(is.finite(lambda_ts), 1, function(r) any(r))
+  lambda_ts <- lambda_ts[ok_time, , drop = FALSE]
+  r2_vec <- r2_vec[ok_time]
+  nobs_vec <- nobs_vec[ok_time]
+  T_eff <- nrow(lambda_ts)
+  if (T_eff < 2) stop("Second-stage regressions failed (too few usable time periods).")
+  est <- colMeans(lambda_ts, na.rm = TRUE)
+  se_nw <- rep(NA_real_, length(est))
+  names(se_nw) <- names(est)
+  for (j in seq_along(est)) {
+    se_nw[j] <- nw_se_mean(lambda_ts[, j], L = min(nw_lag, T_eff - 1))
+  }
+  shanken_mult <- 1
+  if (isTRUE(shanken)) {
+    f_needed <- factor_vars
+    if (length(f_needed) > 0) {
+      f_panel <- d[order(d[[time]]), c(time, f_needed), drop = FALSE]
+      f_panel <- f_panel[!duplicated(f_panel[[time]]), , drop = FALSE]
+      Fmat <- as.matrix(f_panel[, f_needed, drop = FALSE])
+      Fmat <- Fmat[stats::complete.cases(Fmat), , drop = FALSE]
+      if (nrow(Fmat) >= 3) {
+        mu_f <- colMeans(Fmat)
+        Sigma_f <- stats::cov(Fmat)
+        inv_Sigma <- tryCatch(solve(Sigma_f), error = function(e) NULL)
+        if (!is.null(inv_Sigma)) {
+          shanken_term <- as.numeric(t(mu_f) %*% inv_Sigma %*% mu_f)
+          shanken_mult <- sqrt(1 + shanken_term)
+        }
+      }
+    }
+  }
+  se_sh <- se_nw * shanken_mult
+  if (t_type == "NW") {
+    se_used <- se_nw
+    t_label <- "Newey-West (HAC) t-stat for time-series mean of lambdas"
+  } else {
+    se_used <- se_sh
+    t_label <- "Shanken(1992)-corrected t-stat (applied to NW SEs)"
+  }
+  tval <- est / se_used
+  pval <- 2 * (1 - stats::pt(abs(tval), df = max(1, T_eff - 1)))
+  coef_df <- data.frame(
+    Variable  = names(est),
+    Estimate  = as.numeric(est),
+    Std_Error = as.numeric(se_used),
+    T_Value   = as.numeric(tval),
+    P_Value   = as.numeric(pval),
+    stringsAsFactors = FALSE
+  )
+  list(
+    Observations = as.integer(sum(nobs_vec)),
+    `R-squared` = mean(r2_vec, na.rm = TRUE),
+    coefficients = coef_df,
+    t_type = t_label,
+    nw_lag = as.integer(min(nw_lag, T_eff - 1)),
+    T_effective = as.integer(T_eff),
+    shanken_multiplier = as.numeric(shanken_mult)
+  )
+}
+
+# ---- rm_helper_end ----
+
 {%- endmacro %}
 
 {% macro EXTRACT_COEFS(parsed_name, regression_results_name, model="OLS", error_message="No results given by the current subsample.") -%}
 {% set _m = (model | string | upper) -%}
-{% if _m in ["FE", "RE", "PLM","OLS"] -%}
+{% if _m in ["FE", "RE", "PLM"] -%}
   {% set fn = "extract_coefficients_plm" -%}
 {% elif _m == "" -%}
   {% set fn = "" -%}
@@ -204,45 +357,45 @@ extract_coefficients_plm <- function(fit) {
 }, error = function(e) { {{ error_message | tojson }} })
 {%- endmacro %}
 
-{% macro set_category_controls(fields=[], output_data_variable="r_df", input_data_variable="r_df") -%}
+{% macro set_category_controls(fields=[], output_data_variable="df_prep_main_baseline", input_data_variable="df_prep_main_baseline") -%}
 {%- if fields %}
 # 将固定效应变量转换为因子变量
 {% for fe in fields -%}
-{{ output_data_variable }}${{ fe }} <- as.factor({{ input_data_variable }}${{ fe }})
+{{ output_data_variable }}[["{{ fe }}"]] <- as.factor({{ input_data_variable }}[["{{ fe }}"]])
 {% endfor %}
 {%- endif %}
 {%- endmacro %}
 
-{% macro set_panel(set_panel_fields, output_data_variable="r_df", input_data_variable="r_df") -%}
-{{output_data_variable}} <- pdata.frame({{input_data_variable}}, index = c("{{set_panel_fields.entity}}", "{{set_panel_fields.time}}"))
+{% macro set_panel(set_panel_fields, output_data_variable="df_prep_main_baseline", input_data_variable="df_prep_main_baseline") -%}
+{{ output_data_variable }} <- pdata.frame({{ input_data_variable }}, index = c("{{ set_panel_fields.entity }}", "{{ set_panel_fields.time }}"))
 {%- endmacro %}
 
-{% macro clean_sample(fields=[], input_data_variable="r_df", output_data_variable="r_df") -%}
-# 删除在指定列中包含 NA 的行，但保留所有列
+{% macro clean_sample(fields=[], input_data_variable="df_raw_main", output_data_variable="df_prep_main_baseline") -%}
+# 从 {{ input_data_variable }} 读取，清洗后存入 {{ output_data_variable }}
 specified_columns <- c({% for field in fields %}"{{ field }}"{% if not loop.last %}, {% endif %}{% endfor %})
 
 rows_ok <- stats::complete.cases({{ input_data_variable }}[, specified_columns, drop = FALSE])
 {{ output_data_variable }} <- {{ input_data_variable }}[rows_ok, , drop = FALSE]
 {%- endmacro %}
 
-{% macro winsorize(winsorize_percent=0.05, winsorize_fields=[], input_data_variable="r_df", output_data_variable="r_df") %}
+{% macro winsorize(winsorize_percent=0.05, winsorize_fields=[], input_data_variable="df_prep_main_baseline", output_data_variable="df_prep_main_baseline") %}
 # 指定需要 Winsorize 处理的列
 winsorize_columns <- c("{{ winsorize_fields | join('", "') }}")
 
 # 对 winsorize_columns 进行 Winsorize 处理
 {{ output_data_variable }}[winsorize_columns] <- lapply({{ input_data_variable }}[winsorize_columns], function(x) {
   if (is.numeric(x)) {
-    Winsorize(x, val = quantile(x, probs = c({{ winsorize_percent }}, {{ 1 - winsorize_percent }}), na.rm = TRUE)) # 限制上下 {{ winsorize_percent * 100 }}% 分位数
+    Winsorize(x, val = quantile(x, probs = c({{ winsorize_percent }}, {{ 1 - winsorize_percent }}), na.rm = TRUE))
   } else {
-    x  # 保持非数值列不变
+    x
   }
 })
 {% endmacro %}
 
 
-{% macro OLS(regression_model, include_opposite=False, output_data_variable="ols_result", input_data_variable="r_df") -%}
-{# ---------- 子集条件（与原逻辑一致） ---------- #}
-#----------------{{regression_model.name}}----------------#
+{% macro OLS(regression_model, include_opposite=False, output_data_variable="ols_result", regression_data_variable="df_prep_main_baseline") -%}
+{# ---------- 子集条件 ---------- #}
+#----------------{{ regression_model.name }}----------------#
 {% if regression_model.classification_field and regression_model.classification_conditions and regression_model.operator -%}
   {% set subset_condition = '(' ~ regression_model.classification_field ~ ' ' ~ regression_model.operator ~ ' ' ~ regression_model.classification_conditions ~ ')' %}
   {% set subset_statement = ', subset = ' ~ subset_condition %}
@@ -250,7 +403,7 @@ winsorize_columns <- c("{{ winsorize_fields | join('", "') }}")
   {% set not_subset_statement = ', subset = ' ~ not_subset_condition %}
 {% endif -%}
 
-{# ---------- 组装 RHS：X、controls、category_controls=factor(...)（与原逻辑一致） ---------- #}
+{# ---------- 组装 RHS：X、controls、category_controls=factor(...) ---------- #}
 {% set rhs = regression_model.X | join(' + ') -%}
 {% if regression_model.controls -%}
   {% set rhs = rhs ~ ' + ' ~ (regression_model.controls | join(' + ')) -%}
@@ -259,18 +412,125 @@ winsorize_columns <- c("{{ winsorize_fields | join('", "') }}")
   {% set rhs = rhs ~ ' + factor(' ~ (regression_model.category_controls | map('string') | join(') + factor(')) ~ ')' -%}
 {% endif -%}
 
-{# ---------- (1) 正向子集回归：仅输出执行代码 ---------- #}
-reg_{{ output_data_variable }} <- stats::lm({{ regression_model.y }} ~ {{ rhs }}, data = {{ input_data_variable }}{% if subset_statement %} {{ subset_statement }}{% endif %})
+{# ---------- (1) 正向子集回归：data = {{ regression_data_variable }} ---------- #}
+reg_{{ output_data_variable }} <- stats::lm({{ regression_model.y }} ~ {{ rhs }}, data = {{ regression_data_variable }}{% if subset_statement %}{{ subset_statement }}{% endif %})
 
 {# ---------- (2) 反向子集回归（受 include_opposite 控制） ---------- #}
 {% if include_opposite and (regression_model.classification_field and regression_model.classification_conditions and regression_model.operator) -%}
-reg_{{ output_data_variable }}_opposite <- stats::lm({{ regression_model.y }} ~ {{ rhs }}, data = {{ input_data_variable }}{{ not_subset_statement }})
+reg_{{ output_data_variable }}_opposite <- stats::lm({{ regression_model.y }} ~ {{ rhs }}, data = {{ regression_data_variable }}{{ not_subset_statement }})
 {% endif -%}
 {%- endmacro %}
 
-{# 只输出 FE(plm, within) 回归执行代码；拼装逻辑与原模板一致 + 扩展 OLS/1-way/2-way 判定 #}
-{% macro plm(regression_model, include_opposite=False, output_data_variable="fe_result", input_data_variable="r_df") -%}
-{# ---------- 子集条件（与原逻辑一致） ---------- #}
+{% macro fmb_regression(regression_model, include_opposite=False, output_data_variable="fmb_result", regression_data_variable="df_prep_main_baseline", entity_col=None, time_col=None, fmb_options=None, subset_condition=None, subset_condition_neg=None) -%}
+#----------------{{ regression_model.name }}----------------#
+fmb_data_{{ output_data_variable }} <- {{ regression_data_variable }}
+{% if subset_condition %}
+fmb_data_{{ output_data_variable }} <- subset(fmb_data_{{ output_data_variable }}, {{ subset_condition }})
+{% endif %}
+
+{% set rhs_terms = [] %}
+{% if regression_model.X %}
+  {% set rhs_terms = rhs_terms + regression_model.X %}
+{% endif %}
+{% if regression_model.controls %}
+  {% set rhs_terms = rhs_terms + regression_model.controls %}
+{% endif %}
+{% if regression_model.category_controls %}
+  {% set rhs_terms = rhs_terms + regression_model.category_controls %}
+{% endif %}
+{% if rhs_terms %}
+  {% set rhs = rhs_terms | map('string') | join(' + ') %}
+{% else %}
+  {% set rhs = '1' %}
+{% endif %}
+
+formula_{{ output_data_variable }} <- stats::as.formula("{{ regression_model.y }} ~ {{ rhs }}")
+
+reg_{{ output_data_variable }} <- tryCatch({
+  fmb_two_pass(
+    data = fmb_data_{{ output_data_variable }},
+    ts_formula = formula_{{ output_data_variable }},
+    identity = {{ entity_col | tojson }},
+    time = {{ time_col | tojson }},
+    nw_lag = {{ fmb_options.nw_lag }},
+    t_type = {{ fmb_options.t_type }},
+    shanken = {{ fmb_options.shanken }},
+    shanken_use_factors = {{ fmb_options.shanken_factors }}
+  )
+}, error = function(e) list(error = conditionMessage(e)))
+
+{% if include_opposite and subset_condition and subset_condition_neg %}
+fmb_data_{{ output_data_variable }}_opp <- subset({{ regression_data_variable }}, {{ subset_condition_neg }})
+reg_{{ output_data_variable }}_opposite <- tryCatch({
+  fmb_two_pass(
+    data = fmb_data_{{ output_data_variable }}_opp,
+    ts_formula = formula_{{ output_data_variable }},
+    identity = {{ entity_col | tojson }},
+    time = {{ time_col | tojson }},
+    nw_lag = {{ fmb_options.nw_lag }},
+    t_type = {{ fmb_options.t_type }},
+    shanken = {{ fmb_options.shanken }},
+    shanken_use_factors = {{ fmb_options.shanken_factors }}
+  )
+}, error = function(e) list(error = conditionMessage(e)))
+{% endif %}
+{%- endmacro %}
+
+{% macro stepwise_regression(config=None) -%}
+{% if config and config.steps %}
+# ============================================
+# Stepwise controls for {{ config.safe_id }}
+stepwise_vars_{{ config.safe_id }} <- c({{ config.all_vars | map('tojson') | join(', ') }})
+df_stepwise_{{ config.safe_id }} <- {{ config.data_var }}
+{% if config.subset_condition %}
+df_stepwise_{{ config.safe_id }} <- subset(df_stepwise_{{ config.safe_id }}, {{ config.subset_condition }})
+{% endif %}
+df_stepwise_{{ config.safe_id }} <- stats::na.omit(df_stepwise_{{ config.safe_id }}[, stepwise_vars_{{ config.safe_id }}, drop = FALSE])
+stepwise_results_{{ config.safe_id }} <- list()
+{% for step in config.steps %}
+{% set rhs_terms = (config.base_terms + step.controls) | map('string') | list %}
+{% set rhs = " + ".join(rhs_terms + config.fe_terms) if (rhs_terms + config.fe_terms) else "1" %}
+# Step {{ step.index }}: {{ step.label }}
+{% if config.engine == 'fmb' %}
+reg_{{ config.safe_id }}_step{{ step.index }} <- tryCatch({
+  fmb_two_pass(
+    data = df_stepwise_{{ config.safe_id }},
+    ts_formula = stats::as.formula("{{ config.y_var }} ~ {{ rhs }}"),
+    identity = {{ config.panel_entity | tojson }},
+    time = {{ config.panel_time | tojson }},
+    nw_lag = {{ config.fmb_options.nw_lag }},
+    t_type = {{ config.fmb_options.t_type }},
+    shanken = {{ config.fmb_options.shanken }},
+    shanken_use_factors = {{ config.fmb_options.shanken_factors }}
+  )
+}, error = function(e) list(error = conditionMessage(e)))
+{% else %}
+reg_{{ config.safe_id }}_step{{ step.index }} <- {{ config.engine_fun }}({{ config.y_var }} ~ {{ rhs }}, data = df_stepwise_{{ config.safe_id }}{% if config.engine == 'plm' %}{% if config.model %}, model = "{{ config.model }}"{% endif %}{% if config.effect %}, effect = "{{ config.effect }}"{% endif %}{% endif %})
+{% endif %}
+{% if config.engine == 'fmb' %}
+res_{{ step.index }} <- reg_{{ config.safe_id }}_step{{ step.index }}
+{% else %}
+res_{{ step.index }} <- {{ config.extract_fn }}(reg_{{ config.safe_id }}_step{{ step.index }})
+{% endif %}
+entry_{{ step.index }} <- list(
+  step = {{ step.index }},
+  label = "{{ step.label }}",
+  controls_included = c({{ step.controls_expr }}),
+  export_marked = FALSE
+)
+if (is.list(res_{{ step.index }})) {
+  entry_{{ step.index }}$result <- res_{{ step.index }}
+} else {
+  entry_{{ step.index }}$message <- res_{{ step.index }}
+}
+stepwise_results_{{ config.safe_id }}[[length(stepwise_results_{{ config.safe_id }}) + 1]] <- entry_{{ step.index }}
+{% endfor %}
+{% endif %}
+{%- endmacro %}
+
+{# FE/RE (plm) 回归执行代码；data = regression_data_variable #}
+{% macro plm(regression_model, include_opposite=False, output_data_variable="fe_result", regression_data_variable="df_prep_main_baseline") -%}
+{# ---------- 子集条件 ---------- #}
 {% if regression_model.classification_field and regression_model.classification_conditions and regression_model.operator -%}
   {% set subset_condition = '(' ~ regression_model.classification_field ~ ' ' ~ regression_model.operator ~ ' ' ~ regression_model.classification_conditions ~ ')' %}
   {% set subset_statement = ', subset = ' ~ subset_condition %}
@@ -278,7 +538,7 @@ reg_{{ output_data_variable }}_opposite <- stats::lm({{ regression_model.y }} ~ 
   {% set not_subset_statement = ', subset = ' ~ not_subset_condition %}
 {% endif -%}
 
-{# ---------- 组装 RHS：X、controls、category_controls=factor(...)（与原逻辑一致） ---------- #}
+{# ---------- 组装 RHS：X、controls、category_controls=factor(...) ---------- #}
 {% set rhs = regression_model.X | join(' + ') -%}
 {% if regression_model.controls -%}
   {% set rhs = rhs ~ ' + ' ~ (regression_model.controls | join(' + ')) -%}
@@ -287,18 +547,15 @@ reg_{{ output_data_variable }}_opposite <- stats::lm({{ regression_model.y }} ~ 
   {% set rhs = rhs ~ ' + factor(' ~ (regression_model.category_controls | map('string') | join(') + factor(')) ~ ')' -%}
 {% endif -%}
 
-{# ---------- 新增：依据你的规则推导 model/effect（不改原入参/拼装方式） ---------- #}
-{# 模型输入（缺省或非常规时按 FE 处理，保持原行为） #}
+{# ---------- 推导 model/effect ---------- #}
 {% set _model_in = (regression_model.model|string|lower) if regression_model.model is defined else 'fe' %}
 
-{# 面板索引（兼容 entity/id/individual 与 time/year 命名），统一小写 #}
 {% set _pid = regression_model.panel_ids if regression_model.panel_ids is defined else {} %}
 {% set _id   = (_pid.entity or _pid.id or _pid.individual) if _pid else None %}
 {% set _time = (_pid.time   or _pid.year or _pid.t)        if _pid else None %}
 {% set _id_l   = (_id|string|lower)   if _id   is not none else '' %}
 {% set _time_l = (_time|string|lower) if _time is not none else '' %}
 
-{# 固定效应变量列表 = fixed_effects ∪ category_controls（名称小写化）#}
 {% set _fe_raw = regression_model.fixed_effects if regression_model.fixed_effects is defined else None %}
 {% if _fe_raw is sameas(true) %}
   {% set _fe_fixed = [] %}
@@ -313,7 +570,6 @@ reg_{{ output_data_variable }}_opposite <- stats::lm({{ regression_model.y }} ~ 
 {% set _cats_l = (regression_model.category_controls or []) | map('string') | map('lower') | list %}
 {% set _fe_set = (_fe_fixed_l + _cats_l) | unique %}
 
-{# 判定 effect：time 独占→time；id 独占→individual；其余（无/全重合/信息不足）→twoways #}
 {% set _id_match   = (_id_l in _fe_set) %}
 {% set _time_match = (_time_l in _fe_set) %}
 
@@ -331,26 +587,26 @@ reg_{{ output_data_variable }}_opposite <- stats::lm({{ regression_model.y }} ~ 
   {% endif %}
 {% endif %}
 
-{# ---------- (1) 正向子集回归：按推导结果生成 plm 调用 ---------- #}
+{# ---------- (1) 正向子集回归：data = {{ regression_data_variable }} ---------- #}
 {% if _model_arg == 'pooling' %}
-reg_{{ output_data_variable }} <- plm({{ regression_model.y }} ~ {{ rhs }}, data = {{ input_data_variable }}, model = "pooling"{% if subset_statement %} {{ subset_statement }}{% endif %})
+reg_{{ output_data_variable }} <- plm({{ regression_model.y }} ~ {{ rhs }}, data = {{ regression_data_variable }}, model = "pooling"{% if subset_statement %}{{ subset_statement }}{% endif %})
 {% else %}
   {% if _effect_arg in ['individual','time','twoways'] %}
-reg_{{ output_data_variable }} <- plm({{ regression_model.y }} ~ {{ rhs }}, data = {{ input_data_variable }}, model = "within", effect = "{{ _effect_arg }}"{% if subset_statement %} {{ subset_statement }}{% endif %})
+reg_{{ output_data_variable }} <- plm({{ regression_model.y }} ~ {{ rhs }}, data = {{ regression_data_variable }}, model = "within", effect = "{{ _effect_arg }}"{% if subset_statement %}{{ subset_statement }}{% endif %})
   {% else %}
-reg_{{ output_data_variable }} <- plm({{ regression_model.y }} ~ {{ rhs }}, data = {{ input_data_variable }}, model = "within"{% if subset_statement %} {{ subset_statement }}{% endif %})
+reg_{{ output_data_variable }} <- plm({{ regression_model.y }} ~ {{ rhs }}, data = {{ regression_data_variable }}, model = "within"{% if subset_statement %}{{ subset_statement }}{% endif %})
   {% endif %}
 {% endif %}
 
-{# ---------- (2) 反向子集回归（与你原逻辑一致，按 include_opposite 控制） ---------- #}
+{# ---------- (2) 反向子集回归（受 include_opposite 控制） ---------- #}
 {% if include_opposite and (regression_model.classification_field and regression_model.classification_conditions and regression_model.operator) -%}
   {% if _model_arg == 'pooling' %}
-reg_{{ output_data_variable }}_opposite <- plm({{ regression_model.y }} ~ {{ rhs }}, data = {{ input_data_variable }}, model = "pooling"{{ not_subset_statement }})
+reg_{{ output_data_variable }}_opposite <- plm({{ regression_model.y }} ~ {{ rhs }}, data = {{ regression_data_variable }}, model = "pooling"{{ not_subset_statement }})
   {% else %}
     {% if _effect_arg in ['individual','time','twoways'] %}
-reg_{{ output_data_variable }}_opposite <- plm({{ regression_model.y }} ~ {{ rhs }}, data = {{ input_data_variable }}, model = "within", effect = "{{ _effect_arg }}"{{ not_subset_statement }})
+reg_{{ output_data_variable }}_opposite <- plm({{ regression_model.y }} ~ {{ rhs }}, data = {{ regression_data_variable }}, model = "within", effect = "{{ _effect_arg }}"{{ not_subset_statement }})
     {% else %}
-reg_{{ output_data_variable }}_opposite <- plm({{ regression_model.y }} ~ {{ rhs }}, data = {{ input_data_variable }}, model = "within"{{ not_subset_statement }})
+reg_{{ output_data_variable }}_opposite <- plm({{ regression_model.y }} ~ {{ rhs }}, data = {{ regression_data_variable }}, model = "within"{{ not_subset_statement }})
     {% endif %}
   {% endif %}
 {% endif -%}

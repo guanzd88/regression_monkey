@@ -23,7 +23,7 @@ Baseline 组合器（Baseline Explorer / BaselineSpec Generator）
 
 from dataclasses import dataclass, field, asdict
 from reg_monkey.task_obj import StandardRegTask
-from typing import List, Dict, Any, Iterable, Optional, Tuple, Callable
+from typing import List, Dict, Any, Iterable, Optional, Tuple, Callable, Union
 import pandas as pd
 import numpy as np
 import hashlib,itertools,math
@@ -36,7 +36,7 @@ import hashlib,itertools,math
 class BaselineSpec:
     """标准化的 Baseline 规格对象（探索阶段产物）"""
     y: str
-    X: List[str]
+    X: Union[List[str], Dict[str, Union[str, List[str]]]]
     controls: List[str]
     category_controls: List[str]
     model: str
@@ -46,11 +46,15 @@ class BaselineSpec:
     score: Optional[float] = None
     diagnostics: Dict[str, Any] = field(default_factory=dict)
     tags: Dict[str, Any] = field(default_factory=dict)  # e.g., {"is_primary": False, "is_candidate": True}
+    category_controls_mapping: Dict[str, str] = field(default_factory=dict)  # 效应名 → 字段名映射
 
     def to_task(self, base_task: StandardRegTask, name_suffix: Optional[str] = None) -> StandardRegTask:
         name = base_task.name
         if name_suffix:
             name = f"{name}_{name_suffix}"
+        panel_ids = {}
+        if isinstance(getattr(base_task, "panel_ids", None), dict):
+            panel_ids = dict(base_task.panel_ids)
         return StandardRegTask(
             name=name,
             dataset=base_task.dataset,
@@ -58,8 +62,10 @@ class BaselineSpec:
             X=self.X,
             controls=self.controls,
             category_controls=self.category_controls,
+            category_controls_mapping=self.category_controls_mapping,
             model=self.model,
             options=self.options.copy(),
+            panel_ids=panel_ids,
         )
 
 # =============================
@@ -177,8 +183,10 @@ class BaselineExplorer:
         自变量族及替代测度映射，如 {"Size": ["Size_ln","Size_pctile"]}。
     controls_pool : list[str] | None
         控制变量全集；默认 `base_task.controls`。
-    category_controls_pool : list[str] | None
+    category_controls_pool : list[str] | dict[str, str | list[str]] | None
         固定效应来源列全集；默认 `base_task.category_controls`。
+        可以是列表（字段名列表）或字典（效应名 → 字段名/字段名列表）。
+        字典格式如 {'Company': ['Symbol', 'Stkcd'], 'Year': 'year'} 会生成多种组合。
     subset_list : list[dict] | None
         异质性/子集设置（如 {"name":"HighLev","expr":"HighLev==1"}）；默认 `[None]`。
     X_mode : {"cartesian","lockstep","one_at_a_time"}
@@ -226,7 +234,7 @@ class BaselineExplorer:
         Ys: Optional[List[str]] = None,
         X_alternatives: Optional[Dict[str, List[str]]] = None,
         controls_pool: Optional[List[str]] = None,
-        category_controls_pool: Optional[List[str]] = None,
+        category_controls_pool: Optional[Union[List[str], Dict[str, Union[str, List[str]]]]] = None,
         subset_list: Optional[List[Dict[str, Any]]] = None,
         *,
         # 组合策略
@@ -267,27 +275,41 @@ class BaselineExplorer:
         produced = 0
         specs: List[BaselineSpec] = []
 
-        # 1) 枚举 X 组合
-        X_combos: List[List[str]] = list(self._enumerate_X())
+        # 1) 枚举 X 组合（现在返回分组字典）
+        X_combos: List[Dict[str, Union[str, List[str]]]] = list(self._enumerate_X())
         # 2) 枚举 controls 组合
         control_combos: List[List[str]] = list(self._enumerate_controls())
-        # 3) 枚举 FE 组合
-        fe_combos: List[List[str]] = list(self._enumerate_fes())
+        # 3) 枚举 FE 组合（返回 (字段名列表, 效应映射) 的元组）
+        fe_combos: List[Tuple[List[str], Dict[str, str]]] = list(self._enumerate_fes())
 
-        for y, x_vars, ctrls, fes, model, subset, opts in itertools.product(
+        def _flatten_x_dict(x_dict: Dict[str, Union[str, List[str]]]) -> List[str]:
+            """将 X 分组字典展平为变量列表"""
+            result = []
+            for v in x_dict.values():
+                if isinstance(v, str):
+                    result.append(v)
+                elif isinstance(v, list):
+                    result.extend(v)
+            return result
+
+        for y, x_dict, ctrls, fe_combo, model, subset, opts in itertools.product(
             self.Ys, X_combos, control_combos, fe_combos, self.model_list, self.subset_list, self.options_grid
         ):
             if limit is not None and produced >= limit:
                 break
 
-            # 体检（不修改原数据）
-            diag_ok, diagnostics = self._diagnose(y, x_vars, ctrls, fes, subset, opts)
+            # 解包 FE 组合：(字段名列表, 效应映射)
+            fes, fe_mapping = fe_combo
+
+            # 体检时使用展平后的 X 列表
+            x_flat = _flatten_x_dict(x_dict)
+            diag_ok, diagnostics = self._diagnose(y, x_flat, ctrls, fes, subset, opts)
             if not diag_ok:
                 continue
 
             spec_dict = {
                 "y": y,
-                "X": tuple(x_vars),
+                "X": tuple(sorted(x_dict.items())),  # 使用分组字典生成稳定哈希
                 "controls": tuple(ctrls),
                 "category_controls": tuple(fes),
                 "model": model,
@@ -298,9 +320,10 @@ class BaselineExplorer:
             # 不再计算得分：score 始终为 None
             spec = BaselineSpec(
                 y=y,
-                X=x_vars,
+                X=x_dict,  # 传递分组字典
                 controls=ctrls,
                 category_controls=fes,
+                category_controls_mapping=fe_mapping,  # 存储效应映射
                 model=model,
                 subset=subset,
                 options=opts,
@@ -320,10 +343,18 @@ class BaselineExplorer:
             self.materialize()
         rows = []
         for s in self._materialized:
+            # X 可能是 dict 或 list
+            if isinstance(s.X, dict):
+                x_str = "; ".join(
+                    f"{k}:{','.join(v) if isinstance(v, list) else v}"
+                    for k, v in s.X.items()
+                )
+            else:
+                x_str = ",".join(s.X)
             row = {
                 "spec_id": s.spec_id,
                 "y": s.y,
-                "X": ",".join(s.X),
+                "X": x_str,
                 "controls": ",".join(s.controls),
                 "category_controls": ",".join(s.category_controls),
                 "model": s.model,
@@ -342,28 +373,30 @@ class BaselineExplorer:
         return [s.to_task(self.base_task, name_suffix=name_suffix) for s in specs]
 
     # ---------- 内部：枚举 ----------
-    def _enumerate_X(self) -> Iterable[List[str]]:
+    def _enumerate_X(self) -> Iterable[Dict[str, Union[str, List[str]]]]:
+        """枚举 X 组合，返回分组字典"""
         # X_mode: cartesian / lockstep / one_at_a_time
         mapping = self.X_alternatives
         if self.X_mode == "cartesian":
             for m in cartesian(mapping):
-                yield list(m.values())
+                # m 是 {族名: 选中变量} 的字典，直接返回
+                yield dict(m)
         elif self.X_mode == "lockstep":
             for m in lockstep_zip(mapping):
-                yield list(m.values())
+                yield dict(m)
         elif self.X_mode == "one_at_a_time":
             # 逐一替换一个自变量：其余取第一个测度
             keys = list(mapping.keys())
             base_choice = {k: mapping[k][0] for k in keys}
-            # 同时包含“全部默认”的一种
-            yield list(base_choice.values())
+            # 同时包含"全部默认"的一种
+            yield dict(base_choice)
             for k in keys:
                 for alt in mapping[k]:
                     if alt == base_choice[k]:
                         continue
                     choice = base_choice.copy()
                     choice[k] = alt
-                    yield list(choice.values())
+                    yield dict(choice)
         else:
             raise ValueError(f"Unknown X_mode: {self.X_mode}")
 
@@ -383,15 +416,64 @@ class BaselineExplorer:
         else:
             raise ValueError(f"Unknown controls_mode: {self.controls_mode}")
 
-    def _enumerate_fes(self) -> Iterable[List[str]]:
-        pool = self.category_controls_pool or []
-        if self.fe_mode == "fixed":
-            yield list(pool)
-        elif self.fe_mode == "powerset":
-            for combo in powerset(pool):
-                yield list(combo)
+    def _enumerate_fes(self) -> Iterable[Tuple[List[str], Dict[str, str]]]:
+        """
+        枚举固定效应组合。
+
+        支持两种输入格式：
+        1. List[str]: 直接作为字段名列表，如 ['Symbol', 'year']
+        2. Dict[str, Union[str, List[str]]]: 效应名 → 字段名映射
+           如 {'Company': ['Symbol', 'Stkcd'], 'Year': 'year'}
+           会生成所有组合: ['Symbol', 'year'], ['Stkcd', 'year']
+
+        Returns:
+            Iterable of (field_names_list, effect_mapping_dict)
+            - field_names_list: 用于回归的字段名列表
+            - effect_mapping_dict: 效应名 → 字段名的映射（用于表格渲染）
+        """
+        pool = self.category_controls_pool
+        if pool is None:
+            pool = []
+
+        # 如果是字典格式，需要枚举所有字段组合
+        if isinstance(pool, dict):
+            # 将每个值标准化为列表
+            effect_names = list(pool.keys())
+            field_alternatives = []
+            for name in effect_names:
+                val = pool[name]
+                if isinstance(val, str):
+                    field_alternatives.append([val])
+                else:
+                    field_alternatives.append(list(val))
+
+            # 生成所有字段组合
+            if self.fe_mode == "fixed":
+                # 固定模式：枚举所有字段替代组合
+                for combo in itertools.product(*field_alternatives):
+                    # 构建效应名 → 字段名的映射
+                    mapping = {effect_names[i]: combo[i] for i in range(len(effect_names))}
+                    yield list(combo), mapping
+            elif self.fe_mode == "powerset":
+                # 幂集模式：先枚举字段替代组合，再对每个组合做幂集
+                for field_combo in itertools.product(*field_alternatives):
+                    full_mapping = {effect_names[i]: field_combo[i] for i in range(len(effect_names))}
+                    for subset in powerset(field_combo):
+                        # 子集的映射只包含被选中的字段
+                        subset_list = list(subset)
+                        subset_mapping = {k: v for k, v in full_mapping.items() if v in subset_list}
+                        yield subset_list, subset_mapping
+            else:
+                raise ValueError(f"Unknown fe_mode: {self.fe_mode}")
         else:
-            raise ValueError(f"Unknown fe_mode: {self.fe_mode}")
+            # 列表格式：原有逻辑，映射为空
+            if self.fe_mode == "fixed":
+                yield list(pool), {}
+            elif self.fe_mode == "powerset":
+                for combo in powerset(pool):
+                    yield list(combo), {}
+            else:
+                raise ValueError(f"Unknown fe_mode: {self.fe_mode}")
 
     # ---------- 内部：体检与打分 ----------
     def _diagnose(

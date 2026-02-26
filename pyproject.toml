@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "regression_monkey"
-version = "0.1.2"
+version = "0.2.0"
 description = "Reproducible regression workflow: loaders → dependency tracking → codegen → execution."
 readme = {file = "README.md", content-type = "text/markdown"}
-requires-python = ">=3.9"
+requires-python = ">=3.14"
 license = {file = "LICENSE"}
 authors = [{name="Your Name", email="you@example.com"}]
-keywords = ["econometrics","regression","reproducibility","rpy2","jinja2","arcticdb"]
+keywords = ["econometrics","regression","reproducibility","rpy2","jinja2","arcticdb","textual"]
 
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -19,27 +19,31 @@ classifiers = [
   "Programming Language :: Python",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.9",
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering",
   "Topic :: Scientific/Engineering :: Information Analysis"
 ]
 
 dependencies = [
-  "pandas>=2.0",
-  "numpy>=1.24",
+  "pandas>=2.1",
+  "numpy>=1.26",
   "jinja2>=3.1",
-  # rpy2 is optional; skip on Windows by default to reduce friction.
-  "rpy2>=3.5; platform_system != 'Windows'",
-  "pyyaml>=6.0",
-  "arcticdb>=6.2.3"
+  "pyarrow>=14.0",
+  "openpyxl>=3.1",
+  "arcticdb>=6.2.3",
+  "textual>=0.52",
+  "rich>=13.7",
+  # rpy2 remains optional on Windows environments where R is unavailable.
+  "rpy2>=3.5; platform_system != 'Windows'"
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "black>=24.0", "ruff>=0.5", "build>=1.2.1", "twine>=5.0"]
-full = ["arcticdb>=4.5"]
+dev = [
+  "pytest>=8.0",
+  "black>=24.4",
+  "ruff>=0.5",
+  "build>=1.2.1",
+  "twine>=5.0"
+]
 
 [project.urls]
 Homepage = "https://example.com/regmonkey"
