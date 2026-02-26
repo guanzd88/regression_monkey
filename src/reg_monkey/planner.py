@@ -1,32 +1,80 @@
+# planner_withNameBracketBidir.py
 from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Iterable, Literal, Deque
+from typing import Any, Callable, Dict, List, Optional, Iterable, Literal, Deque, Union
 from collections import deque
+import re
+
 from reg_monkey.task_obj import StandardRegTask
+from reg_monkey.util import name_bracket_bidir
+from reg_monkey.plan_config import PlanConfig, TaskNodeConfig
+
+
+# =========================
+# 用于安全装载 exec_result（保留原结构，但避免 DataFrame 打印时递归崩掉）
+# =========================
+class OpaqueExecResult:
+    """
+    包装 exec_result（dict: {'forward_res': DataFrame, 'opposite_res': DataFrame|None}）
+    - .value 保留原始结构（你要用原 dict 就取 .value）
+    - repr/str 不展开 DataFrame，避免 pandas.pretty 触发 StopIteration
+    """
+    __slots__ = ("value",)
+
+    def __init__(self, value: Any):
+        self.value = value
+
+    def __repr__(self) -> str:
+        v = self.value
+        if isinstance(v, dict):
+            keys = list(v.keys())
+            return f"<exec_result dict keys={keys}>"
+        return f"<exec_result {type(v).__name__}>"
+
+    __str__ = __repr__
+
 
 # ---------------------------
 # TaskNode - 任务节点
 # ---------------------------
 @dataclass(eq=False)
 class TaskNode:
-    task: 'StandardRegTask'
+    task: "StandardRegTask"
     section: str
     tags: List[str] = field(default_factory=list)
     note: str = ""
-    children: List['TaskNode'] = field(default_factory=list)
+    children: List["TaskNode"] = field(default_factory=list)
 
-    def add_child(self, child: 'TaskNode') -> 'TaskNode':
-        # --- ADDED: ensure task_id on the child task at attach-time ---
+    def add_child(self, child: "TaskNode") -> "TaskNode":
+        """
+        双保险：
+        1) child.task.task_id 为空 -> 生成
+        2) child.task.task_id == parent.task.task_id（继承父 id）-> 重新生成
+        同时兜底：挂载时做变量名 name_bracket_bidir 规范化
+        """
         try:
+            parent_task = getattr(self, "task", None)
+            parent_id = getattr(parent_task, "task_id", None) if parent_task is not None else None
+
             t = getattr(child, "task", None)
-            if t is not None and (getattr(t, "task_id", None) in (None, "")):
-                gen = getattr(t, "_generate_task_id", None)
-                if callable(gen):
-                    t.task_id = gen()
+            if t is not None:
+                # 1) 变量名规范化兜底
+                try:
+                    _normalize_task_varnames_inplace(t)
+                except Exception:
+                    pass
+
+                # 2) task_id 生成/重置
+                cur_id = getattr(t, "task_id", None)
+                need_regen = (cur_id in (None, "")) or (parent_id not in (None, "") and cur_id == parent_id)
+                if need_regen:
+                    gen = getattr(t, "_generate_task_id", None)
+                    if callable(gen):
+                        t.task_id = gen()
         except Exception:
-            # 不让 ID 生成异常影响添加流程
             pass
-        # --- ORIGINAL ---
+
         self.children.append(child)
         return child
 
@@ -41,134 +89,320 @@ def _accumulate(lst: List[str]) -> List[List[str]]:
         acc.append(cur)
     return acc
 
+
+# ---------------------------
+# 变量名规范化：对 StandardRegTask 做就地处理
+# ---------------------------
+_FIELD_CALL_PAT = re.compile(r"field\(\s*([^)]+?)\s*\)")
+
+
+def _rewrite_field_calls(expr: Any) -> Any:
+    """
+    把 subset.classification_conditions 里出现的 field(<col>) 的 <col> 也做 name_bracket_bidir。
+    """
+    if not isinstance(expr, str) or not expr:
+        return expr
+
+    def _repl(m):
+        inner = (m.group(1) or "").strip()
+        try:
+            inner2 = name_bracket_bidir(inner)
+        except Exception:
+            inner2 = inner
+        return f"field({inner2})"
+
+    return _FIELD_CALL_PAT.sub(_repl, expr)
+
+
+def _wrap_generate_roles_with_bidir(task: StandardRegTask) -> None:
+    """
+    roles.fields 也要走 name_bracket_bidir。
+    roles 是动态生成（generate_roles），这里包装 generate_roles：
+    - 返回 dict 且含 fields(list[str]) 时，转换后再返回
+    """
+    if getattr(task, "_name_bidir_roles_wrapped", False):
+        return
+
+    orig = getattr(task, "generate_roles", None)
+    if not callable(orig):
+        return
+
+    def _wrapped_generate_roles(*args, **kwargs):
+        roles = orig(*args, **kwargs)
+        if isinstance(roles, dict) and isinstance(roles.get("fields"), list):
+            try:
+                roles = dict(roles)
+                roles["fields"] = name_bracket_bidir(list(roles["fields"]))
+            except Exception:
+                pass
+        return roles
+
+    try:
+        setattr(task, "_orig_generate_roles", orig)
+        setattr(task, "generate_roles", _wrapped_generate_roles)
+        setattr(task, "_name_bidir_roles_wrapped", True)
+    except Exception:
+        pass
+
+
+def _normalize_task_varnames_inplace(task: StandardRegTask) -> StandardRegTask:
+    """
+    按你的清单就地处理这些位置：
+    y / X / controls / category_controls / panel_ids(entity/time) / subset(field(...)) / roles.fields
+    """
+    # y
+    if isinstance(getattr(task, "y", None), str):
+        task.y = name_bracket_bidir(task.y)
+
+    # X / controls / category_controls
+    X0 = getattr(task, "X", None)
+    C0 = getattr(task, "controls", None)
+    CC0 = getattr(task, "category_controls", None)
+
+    if isinstance(X0, str):
+        task.X = name_bracket_bidir(X0)
+    elif isinstance(X0, list):
+        task.X = name_bracket_bidir(X0)
+    elif isinstance(X0, dict):
+        # 处理分组字典
+        normalized = {}
+        for k, v in X0.items():
+            if isinstance(v, str):
+                normalized[k] = name_bracket_bidir(v)
+            elif isinstance(v, list):
+                normalized[k] = name_bracket_bidir(v)
+            else:
+                normalized[k] = v
+        task.X = normalized
+
+    if isinstance(C0, list):
+        task.controls = name_bracket_bidir(C0)
+    elif isinstance(C0, str):
+        task.controls = name_bracket_bidir(C0)
+
+    if isinstance(CC0, list):
+        task.category_controls = name_bracket_bidir(CC0)
+    elif isinstance(CC0, str):
+        task.category_controls = name_bracket_bidir(CC0)
+
+    # panel_ids(entity/time)
+    pids = getattr(task, "panel_ids", None)
+    if isinstance(pids, dict):
+        pids2 = dict(pids)
+        for k in ("entity", "time"):
+            v = pids2.get(k)
+            if isinstance(v, str) and v:
+                try:
+                    pids2[k] = name_bracket_bidir(v)
+                except Exception:
+                    pass
+        task.panel_ids = pids2
+
+    # subset(field(...))
+    subset = getattr(task, "subset", None)
+    if isinstance(subset, dict):
+        subset2 = dict(subset)
+        cf = subset2.get("classification_field")
+        if isinstance(cf, str) and cf:
+            subset2["classification_field"] = name_bracket_bidir(cf)
+
+        cond = subset2.get("classification_conditions")
+        subset2["classification_conditions"] = _rewrite_field_calls(cond)
+
+        task.subset = subset2
+
+    # roles.fields（通过包装 generate_roles 来实现）
+    _wrap_generate_roles_with_bidir(task)
+
+    return task
+
+
 # ---------------------------
 # Plan 类 - 主控制类
 # ---------------------------
 class Plan:
     """
     任务规划器（Plan）
-
-    概述
-    ----
-    将一个或一组 `StandardRegTask` 作为“baseline 根”挂成森林（每个 baseline 一棵树），
-    提供统一的**构建派生任务**、**遍历与筛选**、**批量代码生成**、**结果验收**与**物化导出**
-    能力。每个树节点为 `TaskNode`，承载 `task`（具体回归规格）、`section`（模块/阶段标签）、
-    `tags` 与子节点等信息。初始化时会确保根任务具备 `task_id`。  # noqa
-
-    快速上手
-    -------
-    >>> plan = Plan(baseline_task)                              # 以 baseline 为根建一棵树
-    >>> plan = (plan
-    ...         .baseline(incremental_controls=True)            # 增量控制变量序列
-    ...         .post_perf(["ROA_post", "ROE_post"])            # 事后绩效
-    ...         .mechanisms(["Cash","Inv"])                     # 机制检验
-    ...         .robust_model(["OLS","FE","RE"])                # 模型稳健性
-    ...        )
-    >>> plan.render_code_in_batch()                              # 批量生成代码并处理指纹继承
-    >>> print(plan.preview())                                    # 人类可读的任务预览
-    >>> acc = plan.evaluate_acceptance_over_forest()             # True/False + 星标（*** / ** / *）
-    >>> df  = plan.to_materialize()                              # 将整片森林物化为 DataFrame
-
-    重要属性
-    --------
-    - roots : List[TaskNode]
-        每个 baseline 构成一棵根；构造时会复制 baseline（name=“baseline”，note=“baseline”），并尽量生成 task_id。
-
-    结构遍历与筛选
-    --------------
-    - iter_roots() -> Iterable[TaskNode]
-        返回根节点列表的副本。
-    - iter_tree(root, order="dfs") -> Iterable[TaskNode]
-        遍历单棵树（深/广）。
-    - _traverse_nodes(roots, order="dfs") -> List[TaskNode]
-        内部通用遍历器，供多处复用。
-    - flatten(order="dfs") -> List[StandardRegTask]
-        将整个森林的节点 task 平铺为列表。
-    - flatten_by_tree(order="dfs") -> List[List[StandardRegTask]]
-        按树分组的平铺。
-    - preview(order="dfs") -> str
-        以 “section name: y ~ RHS [meta]” 形式生成可读预览。
-    - only(pred_or_section) -> Plan
-        仅保留满足谓词或给定 section 的节点及其祖先，返回新的 Plan（不改动原树结构顺序）。
-    - skip(pred_or_section) -> Plan
-        按谓词或 name 前缀**标记**节点 `active=False`，不改结构与顺序（未命中置为 True）。
-
-    任务生成（派生规格）
-    -------------------
-    - baseline(incremental_controls: bool=False) -> Plan
-        若开启 `incremental_controls=True`：在 baseline 下按控制变量“累进”生成子任务，并将根 baseline 标记为 inactive。
-    - post_perf(ys: List[str], name_fmt="{base}_post_{y}", if_reprep=False) -> Plan
-        按给定 Ys 复制生成“事后绩效”任务（section="post_acq_perf"）。
-    - mechanisms(ys: List[str], name_fmt="{base}_mech_{y}", if_reprep=False) -> Plan
-        机制检验（section="mechanism"）。
-    - heterogeneity(splits: List[dict], if_reprep=False) -> Plan
-        R 侧条件表达式的异质性拆分：将 `subset` 写入 task（section="heterogeneity"）。
-    - robust_model(models: List[str]) -> Plan
-        基于模型名（如 "OLS"/"FE"/"RE"）展开稳健性变体；内部“hub”节点在无子项时移除，有子项时被扁平化。
-    - robust_measure(y_alternatives=None, x_sets=None, control_sets=None) -> Plan
-        对 y / X / controls 的替代表列进行稳健性变体扩展；同样自动扁平化 hub。
-
-    代码生成与输出
-    --------------
-    - render_code_in_batch(order="dfs", codegen=None, strict=True, logger=None) -> Plan
-        批量调用外部 `codegen(task)` 或 `task.generate_code()`，写回 `task.code_text` 与
-        `prep_fingerprint`，并在整棵树内执行**指纹继承与一致性校验**（非 `if_reprep` 节点必须等于根指纹）。
-    - output_r_code_by_tree(include_prepare=True, with_headers=True,
-                            collect_dependencies=True, on_missing_prepare="comment") -> List[dict]
-        生成每棵树的 R 脚本（按规则决定何时渲染 `prepare_code`；`active=False` 时不输出执行/后处理代码），
-        汇总 `deps` 并把节点文本写回 `task.code_text`。
-
-    结果验收与物化
-    --------------
-    - evaluate_acceptance_over_forest(order="dfs") -> List[dict]
-        遍历所有节点，调用 `task.evaluate_acceptance(alpha)`：
-          * baseline（name 以 "baseline" 开头）使用 `self.cfg.significance_level`；
-          * 非 baseline 依次用 0.01 / 0.05 / 0.10，命中即停；
-          * 星标规则：0.01→"***"、0.05→"**"、0.10→"*"，未通过为 ""；
-        返回包含 `task_id/name/section/accepted/used_alpha/mark` 的列表。
-    - to_materialize() -> pd.DataFrame
-        将森林平铺为表，列：`task_id/name/dataset/section/model/y/X/controls/category_controls/panel_ids/exec_result/subset/if_reprep/active/mark`，
-        并把上面的验收结果（转为 `[['task_id','section','mark']]`）按 `task_id` 左连接。为避免 pandas 在打印时遍历
-        可迭代对象触发 `StopIteration`，对“非基础类型”字段会安全地 `repr` 序列化。
-
-    设计约定
-    --------
-    * 绝不隐式修改树结构的相对顺序；`skip()` 只改 `active` 标记。
-    * 代码生成阶段若节点设置 `if_reprep=True`，其 `prep_fingerprint` 必须自洽；否则非 `if_reprep` 节点会继承根指纹。
-    * `TaskNode.add_child()` 与 Plan 初始化阶段会尽力为新任务生成 `task_id`，即使上游未显式提供。
-    * 内部辅助 `_map_roots(fn)` 用于对每棵树“原地”应用构建操作。
-
-    依赖与类型
-    ----------
-    * 依赖：`StandardRegTask`, `TaskNode`, `dataclasses`, `typing`, `collections.deque`, `pandas`（仅在物化时）。
-    * 遍历顺序：`order` 取值 `"dfs"` / `"bfs"`；未指明时默认 `"dfs"`。
-
     """
-    def __init__(self, baseline: 'StandardRegTask | List[StandardRegTask]'):
+
+    def __init__(self, baseline: "StandardRegTask | List[StandardRegTask]"):
         bases = baseline if isinstance(baseline, list) else [baseline]
         if not bases:
             raise ValueError("Plan() requires at least one StandardRegTask as baseline")
-        self.roots: List[TaskNode] = [
-            TaskNode(
-                task=b.copy_with(name=f"baseline", note="baseline"),
-                section="baseline",
-                tags=["baseline"],
-                note="baseline",
-            )
-            for b in bases
-        ]
-        # --- ADDED: ensure task_id for every root task right after creation ---
+
+        self.roots: List[TaskNode] = []
+        for b in bases:
+            t = b.copy_with(name="baseline", note="baseline")
+            try:
+                _normalize_task_varnames_inplace(t)
+            except Exception:
+                pass
+            self.roots.append(TaskNode(task=t, section="baseline", tags=["baseline"], note="baseline"))
+
+        # ensure task_id for roots
         try:
-            for _node in self.roots:
-                _t = getattr(_node, "task", None)
-                if _t is not None and (getattr(_t, "task_id", None) in (None, "")):
-                    _gen = getattr(_t, "_generate_task_id", None)
-                    if callable(_gen):
-                        _t.task_id = _gen()
+            for node in self.roots:
+                t = getattr(node, "task", None)
+                if t is not None and (getattr(t, "task_id", None) in (None, "")):
+                    gen = getattr(t, "_generate_task_id", None)
+                    if callable(gen):
+                        t.task_id = gen()
         except Exception:
-            # 不让 ID 生成异常影响 Plan 初始化
             pass
 
+    def to_config(self) -> PlanConfig:
+        roots = [self._node_to_config(node) for node in self.roots]
+        return PlanConfig(version="1.0", roots=roots)
+
+    @classmethod
+    def from_config(cls, config: "PlanConfig | Dict[str, Any]") -> "Plan":
+        if isinstance(config, dict):
+            cfg = PlanConfig.from_dict(config)
+        else:
+            cfg = config
+        plan = object.__new__(cls)
+        plan.roots = [cls._node_from_config(node_cfg) for node_cfg in getattr(cfg, "roots", [])]
+        return plan
+
+    @staticmethod
+    def _node_to_config(node: TaskNode) -> TaskNodeConfig:
+        task = getattr(node, "task", None)
+        spec = task.to_spec() if hasattr(task, "to_spec") and task is not None else {}
+        children = [Plan._node_to_config(child) for child in getattr(node, "children", [])]
+        return TaskNodeConfig(
+            section=getattr(node, "section", ""),
+            tags=list(getattr(node, "tags", []) or []),
+            note=getattr(node, "note", ""),
+            task_spec=spec,
+            children=children,
+        )
+
+    @classmethod
+    def _node_from_config(cls, node_cfg: "TaskNodeConfig | Dict[str, Any]") -> TaskNode:
+        if isinstance(node_cfg, dict):
+            config = TaskNodeConfig.from_dict(node_cfg)
+        else:
+            config = node_cfg
+        task_spec = getattr(config, "task_spec", {}) or {}
+        task = StandardRegTask.from_spec(task_spec) if task_spec else None
+        node = TaskNode(
+            task=task,
+            section=config.section,
+            tags=list(config.tags or []),
+            note=config.note,
+            children=[],
+        )
+        for child_cfg in getattr(config, "children", []) or []:
+            node.children.append(cls._node_from_config(child_cfg))
+        return node
+
+    # ---------------------------
+    # 数据上下文分配
+    # ---------------------------
+    def assign_data_contexts(self) -> "Plan":
+        """在任务树初始化阶段为每个任务分配数据变量上下文。"""
+        for root in self.roots:
+            root_task = getattr(root, "task", None)
+            if root_task is None:
+                continue
+
+            baseline_ds = self._get_task_dataset_key(root_task)
+            root_task._data_context = {
+                "input_data_variable": f"df_raw_{baseline_ds}",
+                "output_data_variable": f"df_prep_{baseline_ds}_baseline",
+                "regression_data_variable": f"df_prep_{baseline_ds}_baseline",
+            }
+
+            for node in self._traverse_nodes([root], order="dfs"):
+                if node is root:
+                    continue
+                task = getattr(node, "task", None)
+                if task is None:
+                    continue
+                self._assign_task_context(task, baseline_ds)
+
+        return self
+
+    def _assign_task_context(self, task: Any, baseline_ds: str) -> None:
+        ds = self._get_task_dataset_key(task) or baseline_ds
+        if_reprep = bool(getattr(task, "if_reprep", False))
+
+        if if_reprep or ds != baseline_ds:
+            suffix = self._get_safe_task_suffix(task)
+            ctx = {
+                "input_data_variable": f"df_raw_{ds}",
+                "output_data_variable": f"df_prep_{ds}_{suffix}",
+                "regression_data_variable": f"df_prep_{ds}_{suffix}",
+            }
+        else:
+            ctx = {
+                "input_data_variable": f"df_prep_{baseline_ds}_baseline",
+                "output_data_variable": None,
+                "regression_data_variable": f"df_prep_{baseline_ds}_baseline",
+            }
+
+        setattr(task, "_data_context", ctx)
+
+    def _get_safe_task_suffix(self, task: Any) -> str:
+        candidate = getattr(task, "task_id", None) or getattr(task, "name", None) or "task"
+        candidate = re.sub(r"[^A-Za-z0-9_]", "_", str(candidate))
+        if candidate and candidate[0].isdigit():
+            candidate = "_" + candidate
+        candidate = candidate.lower()
+        return candidate or "task"
+
+    def _get_task_dataset_key(self, task: Any) -> str:
+        if hasattr(task, "get_dataset_key") and callable(getattr(task, "get_dataset_key")):
+            try:
+                key = task.get_dataset_key()
+                if key:
+                    return key
+            except Exception:
+                pass
+        dataset = getattr(task, "dataset", None)
+        if dataset:
+            safe = re.sub(r"[^A-Za-z0-9_]", "_", str(dataset))
+            if safe and safe[0].isdigit():
+                safe = "_" + safe
+            return safe or "main"
+        return "main"
+
+    # =========================
+    # ✅ 核心修复：统一派生任务（强制 task_id=None）
+    # =========================
+    def _spawn(self, base: StandardRegTask, **overrides) -> StandardRegTask:
+        """
+        所有派生任务都必须用这个：
+        - 强制 task_id=None，防止继承 baseline 的 id（导致 baseline 重复 / 缓存污染 / merge 笛卡尔积）
+        - 做变量名规范化，确保和 R 环境列名一致（car[-30,0] 等）
+        - 数据集继承：子任务默认继承父任务 dataset，可通过 overrides 显式覆盖
+        - 跨数据集校验：若子任务使用不同 dataset，自动设置 if_reprep=True
+        """
+        overrides = dict(overrides or {})
+        overrides["task_id"] = None
+        if getattr(base, "task_id", None) in (None, ""):
+            gen = getattr(base, "_generate_task_id", None)
+            if callable(gen):
+                base.task_id = gen()
+        overrides["parent_task_id"] = base.task_id
+        overrides["task_id"] = None
+
+        # 数据集继承逻辑
+        base_dataset = getattr(base, "dataset", None)
+        child_dataset = overrides.get("dataset")
+        if child_dataset is None:
+            # 子任务未显式指定 dataset，继承父任务
+            overrides["dataset"] = base_dataset
+        elif child_dataset != base_dataset:
+            # 跨数据集：强制 if_reprep=True（跨数据集必须重新准备数据，不可覆盖）
+            overrides["if_reprep"] = True
+
+        t = base.copy_with(**overrides)
+        try:
+            _normalize_task_varnames_inplace(t)
+        except Exception:
+            pass
+        return t
 
     def iter_roots(self) -> Iterable[TaskNode]:
         return list(self.roots)
@@ -176,10 +410,10 @@ class Plan:
     def iter_tree(self, root: TaskNode, order: Literal["dfs", "bfs"] = "dfs") -> Iterable[TaskNode]:
         return self._traverse_nodes([root], order=order)
 
-    def flatten_by_tree(self, order: Literal["dfs", "bfs"] = "dfs") -> List[List['StandardRegTask']]:
+    def flatten_by_tree(self, order: Literal["dfs", "bfs"] = "dfs") -> List[List["StandardRegTask"]]:
         return [[n.task for n in self._traverse_nodes([r], order=order)] for r in self.roots]
 
-    def _traverse_nodes(self, roots: Iterable[TaskNode], order: Literal["dfs","bfs"] = "dfs") -> List[TaskNode]:
+    def _traverse_nodes(self, roots: Iterable[TaskNode], order: Literal["dfs", "bfs"] = "dfs") -> List[TaskNode]:
         out: List[TaskNode] = []
         if order == "bfs":
             q: Deque[TaskNode] = deque(roots)
@@ -195,15 +429,9 @@ class Plan:
             for r in roots:
                 dfs(r)
         return out
-    def only(self, pred_or_section) -> 'Plan':
-        """Filter plan to only *one or more sections* or nodes matching a predicate.
 
-        Usage:
-          - only("mechanism")                  # keep only the 'mechanism' section (per tree), plus ancestors
-          - only(["post_acq_perf","baseline"]) # keep multiple sections
-          - only(lambda n: cond)               # advanced predicate (back-compat)
-        """
-        # Build predicate from section name(s) or callable
+    def only(self, pred_or_section) -> "Plan":
+        """Filter plan to only *one or more sections* or nodes matching a predicate."""
         if callable(pred_or_section):
             pred: Callable[[TaskNode], bool] = pred_or_section
         else:
@@ -211,7 +439,7 @@ class Plan:
                 sections = {pred_or_section}
             else:
                 sections = set(pred_or_section)
-            pred = lambda n: n.section in sections
+            pred = lambda n: n.section in sections  # noqa: E731
 
         keep: set[TaskNode] = set()
         parent: Dict[TaskNode, Optional[TaskNode]] = {}
@@ -245,20 +473,10 @@ class Plan:
         new_plan.roots = [x for x in (filter_tree(r) for r in self.roots) if x is not None]
         return new_plan
 
-    def skip(self, pred_or_section) -> 'Plan':
-        """Mark tasks as inactive (active=False) without changing tree structure or order.
-
-        New behavior:
-        - If `pred_or_section` is callable: use it as predicate over TaskNode `n`.
-        - Else: treat as str or List[str] of name prefixes; match if any prefix is a
-            prefix of `StandardRegTask.name`.
-        - For every task in every tree: if predicate matches -> task.active = False,
-            else task.active = True.
-        - Preserve tree and children order; do NOT remove or reorder nodes.
-        """
-        # 1) 归一化谓词
+    def skip(self, pred_or_section) -> "Plan":
+        """Mark tasks as inactive (active=False) without changing tree structure or order."""
         if callable(pred_or_section):
-            pred = pred_or_section  # expects lambda n: bool
+            pred = pred_or_section
         else:
             preds = pred_or_section
             if isinstance(preds, str):
@@ -272,9 +490,8 @@ class Plan:
                 name = getattr(t, "name", None)
                 return isinstance(name, str) and any(name.startswith(p) for p in preds)
 
-        # 2) 遍历所有任务树，按原有顺序设置 active 标记；不修改结构
         for root in getattr(self, "roots", []) or []:
-            queue = [root]  # BFS/顺序遍历：不改变结构与相对顺序
+            queue = [root]
             while queue:
                 node = queue.pop(0)
                 try:
@@ -284,169 +501,199 @@ class Plan:
 
                 task = getattr(node, "task", None)
                 if task is not None:
-                    # 命中则禁用；未命中则启用
                     try:
                         setattr(task, "active", not matched)
                     except Exception:
-                        # 兜底：如果没有 active 字段，尝试兼容 enabled 语义
                         try:
                             setattr(task, "enabled", not matched)
                         except Exception:
                             pass
 
                 children = getattr(node, "children", None) or []
-                # 保序加入队列（不改变树与子节点顺序）
                 for ch in children:
                     queue.append(ch)
 
         return self
 
-    def flatten(self, order: str = "dfs") -> List['StandardRegTask']:
+    def flatten(self, order: str = "dfs") -> List["StandardRegTask"]:
         return [n.task for n in self._traverse_nodes(self.roots, order=order)]
 
     def preview(self, order: str = "dfs") -> str:
         lines = []
         for idx, n in enumerate(self._traverse_nodes(self.roots, order=order), start=1):
             t = n.task
-            rhs_bits = (getattr(t, 'X', []) or []) + (getattr(t, 'controls', []) or [])
-            cats = getattr(t, 'category_controls', []) or []
+            rhs_bits = (getattr(t, "X", []) or []) + (getattr(t, "controls", []) or [])
+            cats = getattr(t, "category_controls", []) or []
             if cats:
                 rhs_bits += [f"factor({c})" for c in cats]
             rhs = " + ".join(rhs_bits) if rhs_bits else "1"
-            model = getattr(t, 'model', 'OLS')
-            prep_fp = getattr(t, 'prep_fingerprint', None)
-            mode = (getattr(t, 'options', {}) or {}).get('prep_mode')
+            model = getattr(t, "model", "OLS")
+            prep_fp = getattr(t, "prep_fingerprint", None)
+            mode = (getattr(t, "options", {}) or {}).get("prep_mode")
             suffix = f" [{model}]"
             if prep_fp or mode:
                 pieces = [model]
-                if mode: pieces.append(f"mode={mode}")
-                if prep_fp: pieces.append(f"fp={str(prep_fp)[:8]}…")
+                if mode:
+                    pieces.append(f"mode={mode}")
+                if prep_fp:
+                    pieces.append(f"fp={str(prep_fp)[:8]}…")
                 suffix = " [" + ", ".join(pieces) + "]"
             lines.append(f"[{idx:02d}] {n.section} {t.name}: {t.y} ~ {rhs}{suffix}")
         return "\n".join(lines)
 
     # ---------------------------
-    # 各种任务构建方法（baseline, post_perf, mechanisms等）
+    # 任务构建方法（全部改为 self._spawn）
     # ---------------------------
-    def baseline(self, *, incremental_controls: bool = False) -> 'Plan':
-        """
-        当 incremental_controls=True 时：
-        1) 为每棵任务树在 baseline 根节点下增量添加 controls 子任务；
-        2) 完成添加后，将该树的 root 节点对应的任务标记为 active=False（不执行根 baseline 任务）。
-        """
-        if not incremental_controls:
-            return self
+    def baseline(
+        self,
+        *,
+        incremental_controls: bool = False,
+        include_interaction: bool = False,
+        dataset: str = None,
+    ) -> "Plan":
+        for r in self.roots:
+            t = r.task
+            if t is None:
+                continue
+            if include_interaction:
+                t.interaction = True
+            if dataset is not None:
+                t.dataset = dataset
+            t.incremental_controls = bool(incremental_controls)
+        return self
 
-        def add_inc(r: TaskNode) -> None:
-            base = r.task
-            # 1) 逐步累积 controls 并添加子任务
-            for i, ctrls in enumerate(_accumulate(getattr(base, 'controls', []) or []), start=1):
-                t = base.copy_with(
-                    name=f"{base.name}_inc_{i:02d}",
-                    controls=ctrls,
-                    note=f"controls += {ctrls[-1]}",
-                )
-                r.add_child(
-                    TaskNode(
-                        t,
-                        section="baseline",
-                        tags=["baseline", "inc"],
-                        note=f"controls += {ctrls[-1]}",
-                    )
-                )
-            # 2) 将 root 节点任务标记为不执行
-            try:
-                setattr(base, "active", False)
-            except Exception:
-                # 兜底：部分实现可能使用 enabled 语义
-                try:
-                    setattr(base, "enabled", False)
-                except Exception:
-                    pass
-        return self._map_roots(add_inc)
-
-    def post_perf(self, ys: List[str], name_fmt: str = "{base}_post_{y}", if_reprep: bool = False) -> 'Plan':
+    def post_perf(
+        self,
+        ys: List[str],
+        name_fmt: str = "{base}_post_{y}",
+        if_reprep: bool = False,
+        include_interaction: bool = False,
+        dataset: str = None,
+        incremental_controls: bool = False,
+    ) -> "Plan":
         def add_post(r: TaskNode) -> None:
             base = r.task
+            spawn_kwargs = {
+                "name": "post_perf",
+                "note": f"Y→{{y}}",
+                "if_reprep": if_reprep,
+                "interaction": include_interaction,
+                "incremental_controls": incremental_controls,
+            }
+            if dataset is not None:
+                spawn_kwargs["dataset"] = dataset
             for y in ys:
-                t = base.copy_with(
-                    name='post_perf',
-                    y=y,
-                    note=f"Y→{y}",
-                    if_reprep=if_reprep  # Pass if_reprep to child task
-                )
+                spawn_kwargs["y"] = y
+                spawn_kwargs["note"] = f"Y→{y}"
+                t = self._spawn(base, **spawn_kwargs)
                 r.add_child(TaskNode(t, section="post_acq_perf", tags=["post", "replace_y"], note=f"Y→{y}"))
+
         return self._map_roots(add_post)
 
-    def mechanisms(self, ys: List[str], name_fmt: str = "{base}_mech_{y}", if_reprep: bool = False) -> 'Plan':
+    def mechanisms(
+        self,
+        ys: List[str],
+        name_fmt: str = "{base}_mech_{y}",
+        if_reprep: bool = False,
+        include_interaction: bool = False,
+        dataset: str = None,
+        incremental_controls: bool = False,
+    ) -> "Plan":
         def add_mech(r: TaskNode) -> None:
             base = r.task
+            spawn_kwargs = {
+                "name": "mechanism",
+                "if_reprep": if_reprep,
+                "interaction": include_interaction,
+                "incremental_controls": incremental_controls,
+            }
+            if dataset is not None:
+                spawn_kwargs["dataset"] = dataset
             for y in ys:
-                t = base.copy_with(
-                    name='mechanisms',
-                    y=y,
-                    note=f"Y→{y}",
-                    if_reprep=if_reprep  # Pass if_reprep to child task
-                )
+                spawn_kwargs["y"] = y
+                spawn_kwargs["note"] = f"Y→{y}"
+                t = self._spawn(base, **spawn_kwargs)
                 r.add_child(TaskNode(t, section="mechanism", tags=["mechanism", "replace_y"], note=f"Y→{y}"))
+
         return self._map_roots(add_mech)
 
-    def heterogeneity(self, splits: List[Dict[str, Any]], if_reprep: bool = False) -> 'Plan':
-        """
-        Generates tasks for heterogeneity analysis where splitting conditions
-        are defined in R code instead of Python. Each task can optionally
-        be flagged to independently clean the data by setting `if_reprep`.
-        Args:
-            splits: List of dictionaries defining the splitting conditions, 
-                    where each dictionary should contain:
-                        - field: The variable to split on
-                        - op: The operator (e.g., '>=', '==')
-                        - cond: The condition value (e.g., 'avg_ROCE')
-            if_reprep: A boolean flag to determine if each generated task
-                        should independently clean the data. Default is False.
-        """
+    def heterogeneity(
+        self,
+        splits: List[Dict[str, Any]],
+        if_reprep: bool = False,
+        include_interaction: bool = False,
+        dataset: str = None,
+        incremental_controls: bool = False,
+    ) -> "Plan":
         def add_het(r: TaskNode) -> None:
             base = r.task
+            spawn_kwargs = {
+                "name": "heterogeneity",
+                "if_reprep": if_reprep,
+                "interaction": include_interaction,
+                "incremental_controls": incremental_controls,
+            }
+            if dataset is not None:
+                spawn_kwargs["dataset"] = dataset
             for i, sp in enumerate(splits, start=1):
                 subset = {
                     "classification_field": sp["field"],
                     "operator": sp["op"],
                     "classification_conditions": sp["cond"],
                 }
-                t = base.copy_with(
-                    name="heterogeneity",
-                    subset=subset,  # Directly pass the split condition
-                    note=f"subset={subset}",
-                    if_reprep=if_reprep  # Pass if_reprep to the child task
-                )
+                spawn_kwargs["subset"] = subset
+                spawn_kwargs["note"] = f"subset={subset}"
+                t = self._spawn(base, **spawn_kwargs)
                 r.add_child(TaskNode(t, section="heterogeneity", tags=["heterogeneity", "subset"], note=f"subset={subset}"))
-        
+
         return self._map_roots(add_het)
 
-    def robust_model(self, models: List[str]) -> 'Plan':
+    def robust_model(
+        self,
+        models: List[str],
+        include_interaction: bool = False,
+        dataset: str = None,
+        incremental_controls: bool = False,
+    ) -> "Plan":
         def add_model(r: TaskNode) -> None:
             base = r.task
-            hub = r.add_child(TaskNode(base.copy_with(name=f"{base.model}_models_hub", note="model variants"),
-                                    section="robust_model", tags=["robust", "hub"], note="model variants"))
+            spawn_kwargs = {
+                "name": f"{base.model}_models_hub",
+                "note": "model variants",
+                "interaction": include_interaction,
+                "incremental_controls": incremental_controls,
+            }
+            if dataset is not None:
+                spawn_kwargs["dataset"] = dataset
+            hub_task = self._spawn(base, **spawn_kwargs)
+            hub = r.add_child(TaskNode(hub_task, section="robust_model", tags=["robust", "hub"], note="model variants"))
+
             for m in models:
-                tm = base.copy_with(name=f"robust_model_{m.lower()}", model=m, note=f"model→{m}")
+                model_kwargs = {
+                    "name": f"robust_model_{m.lower()}",
+                    "model": m,
+                    "note": f"model→{m}",
+                    "interaction": include_interaction,
+                    "incremental_controls": incremental_controls,
+                }
+                if dataset is not None:
+                    model_kwargs["dataset"] = dataset
+                tm = self._spawn(base, **model_kwargs)
                 hub.add_child(TaskNode(tm, section="robust_model", tags=["robust", "model"], note=f"model→{m}"))
-            # --- ADDED: flatten hub ---
+
+            # flatten hub
             try:
-                # 若未生成任何变体：直接移除 hub
                 if not hub.children:
                     try:
                         r.children.remove(hub)
                     except ValueError:
                         pass
                 else:
-                    # 有子节点：将子节点提升到父节点 r 的 children 中，并移除 hub
                     try:
                         idx = r.children.index(hub)
                     except ValueError:
                         idx = len(r.children)
-                    promoted = list(hub.children)  # 拷贝
-                    # 先移除 hub
+                    promoted = list(hub.children)
                     try:
                         r.children.pop(idx)
                     except Exception:
@@ -454,123 +701,138 @@ class Plan:
                             r.children.remove(hub)
                         except Exception:
                             pass
-                    # 在原位置插回其子节点（保持顺序）
                     for offset, ch in enumerate(promoted):
                         r.children.insert(idx + offset, ch)
             except Exception:
-                # 任何异常不影响构建流程
                 pass
 
         return self._map_roots(add_model)
-
 
     def robust_measure(
         self,
         *,
         y_alternatives: Optional[List[str]] = None,
-        x_sets: Optional[List[List[str]]] = None,
+        x_sets: Optional[List[Union[List[str], Dict[str, Union[str, List[str]]]]]] = None,
+        if_reprep: bool = False,
         control_sets: Optional[List[List[str]]] = None,
-    ) -> 'Plan':
+        include_interaction: bool = False,
+        dataset: str = None,
+        incremental_controls: bool = False,
+    ) -> "Plan":
         y_alternatives = y_alternatives or []
         x_sets = x_sets or []
         control_sets = control_sets or []
 
         def add_meas(r: TaskNode) -> None:
             base = r.task
-            hub = r.add_child(TaskNode(base.copy_with(name=f"robust_measure_hub", note="measure variants"),
-                                    section="robust_measure", tags=["robust", "measure"], note="measure variants"))
-            for y in y_alternatives:
-                hub.add_child(TaskNode(base.copy_with(name=f"robust_measure_y", y=y, note=f"Y→{y}"),
-                                    section="robust_measure", tags=["robust", "replace_y"], note=f"Y→{y}"))
-            for xs in x_sets:
-                hub.add_child(TaskNode(base.copy_with(name=f"robust_measure_X", X=xs, note=f"X→{xs}"),
-                                    section="robust_measure", tags=["robust", "replace_X"], note=f"X→{xs}"))
-            for cs in control_sets:
-                hub.add_child(TaskNode(base.copy_with(name=f"robust_measure_controls", controls=cs, note=f"controls→{cs}"),
-                                    section="robust_measure", tags=["robust", "replace_controls"], note=f"controls→{cs}"))
+            hub_kwargs = {
+                "name": "robust_measure_hub",
+                "note": "measure variants",
+                "if_reprep": if_reprep,
+                "interaction": include_interaction,
+                "incremental_controls": incremental_controls,
+            }
+            if dataset is not None:
+                hub_kwargs["dataset"] = dataset
+            hub_task = self._spawn(base, **hub_kwargs)
+            hub = r.add_child(TaskNode(hub_task, section="robust_measure", tags=["robust", "measure"], note="measure variants"))
 
-            # --- ADDED: 扁平化 hub —— 如果没有子变体就删除 hub；如果有，把子节点提升到 r 下并移除 hub ---
+            base_kwargs = {
+                "interaction": include_interaction,
+                "if_reprep": if_reprep,
+                "incremental_controls": incremental_controls,
+            }
+            if dataset is not None:
+                base_kwargs["dataset"] = dataset
+
+            for y in y_alternatives:
+                t = self._spawn(base, name="robust_measure_y", y=y, note=f"Y→{y}", **base_kwargs)
+                hub.add_child(TaskNode(t, section="robust_measure", tags=["robust", "replace_y"], note=f"Y→{y}"))
+
+            for xs in x_sets:
+                t = self._spawn(base, name="robust_measure_X", X=xs, note=f"X→{xs}", **base_kwargs)
+                hub.add_child(TaskNode(t, section="robust_measure", tags=["robust", "replace_X"], note=f"X→{xs}"))
+
+            for cs in control_sets:
+                t = self._spawn(base, name="robust_measure_controls", controls=cs, note=f"controls→{cs}", **base_kwargs)
+                hub.add_child(TaskNode(t, section="robust_measure", tags=["robust", "replace_controls"], note=f"controls→{cs}"))
+
+            # flatten hub
             try:
-                # 如果未添加任何变体：直接把 hub 从父节点移除
                 if not hub.children:
                     try:
                         r.children.remove(hub)
                     except ValueError:
                         pass
                 else:
-                    # 有子节点：将子节点整体提升到父节点 r 的 children 中，放在 hub 原位置
                     try:
                         idx = r.children.index(hub)
                     except ValueError:
                         idx = len(r.children)
-                    promoted = list(hub.children)  # 拷贝一份
-                    # 移除 hub 自身
+                    promoted = list(hub.children)
                     try:
                         r.children.pop(idx)
                     except Exception:
-                        # 如果找不到索引，尝试直接移除
                         try:
                             r.children.remove(hub)
                         except Exception:
                             pass
-                    # 在原位置按顺序插入其子节点
                     for offset, ch in enumerate(promoted):
                         r.children.insert(idx + offset, ch)
             except Exception:
-                # 任何异常不影响构建流程
                 pass
 
         return self._map_roots(add_meas)
+
     # ---------------------------
-    # render_code_in_batch 方法
+    # render_code_in_batch 方法（保留+增加兜底规范化）
     # ---------------------------
     def render_code_in_batch(
         self,
         *,
         order: Literal["dfs", "bfs"] = "dfs",
-        codegen: Optional[Callable[['StandardRegTask'], Dict[str, Any]]] = None,
+        codegen: Optional[Callable[["StandardRegTask"], Dict[str, Any]]] = None,
         strict: bool = True,
         logger: Optional[Callable[[str], None]] = None,
     ) -> "Plan":
-        """
-        任务批量代码生成与指纹校验。
-
-        步骤：
-        1) 遍历所有节点（按树结构顺序），生成代码文本并更新 task 对象。
-        2) 统一处理 prep_fingerprint 继承逻辑。
-        3) 校验树内指纹一致性（若 strict=True）。
-        """
         log = logger or (lambda msg: None)
 
-        # ---------- Step 1: 遍历任务树，生成代码 ----------
+        try:
+            self.assign_data_contexts()
+        except Exception:
+            pass
+
+        # Step 0: 兜底规范化一遍
+        for node in self._traverse_nodes(self.roots, order=order):
+            t = getattr(node, "task", None)
+            if t is None:
+                continue
+            try:
+                _normalize_task_varnames_inplace(t)
+            except Exception:
+                pass
+
+        # Step 1: 生成代码
         for root in self.roots:
             for node in self._traverse_nodes([root], order=order):
                 t = node.task
 
-                # 优先使用外部 codegen，否则调用 task 自带 generate_code()
                 if codegen is not None:
                     try:
                         out = codegen(t)
                     except Exception as e:
-                        raise RuntimeError(
-                            f"codegen failed for task {getattr(t, 'name', '<unnamed>')}: {e}"
-                        ) from e
+                        raise RuntimeError(f"codegen failed for task {getattr(t, 'name', '<unnamed>')}: {e}") from e
                 elif hasattr(t, "generate_code"):
                     try:
                         out = t.generate_code()
                     except Exception as e:
-                        raise RuntimeError(
-                            f"generate_code() failed for task {getattr(t, 'name', '<unnamed>')}: {e}"
-                        ) from e
+                        raise RuntimeError(f"generate_code() failed for task {getattr(t, 'name', '<unnamed>')}: {e}") from e
                 else:
-                    raise RuntimeError(
-                        f"Task {getattr(t,'name','<unnamed>')} has neither external codegen nor generate_code()."
-                    )
+                    raise RuntimeError(f"Task {getattr(t,'name','<unnamed>')} has neither external codegen nor generate_code().")
 
                 if not isinstance(out, dict):
                     raise TypeError("codegen/generate_code must return a dict")
 
-                # 提取生成结果字段
                 fp = out.get("prep_fingerprint", getattr(t, "prep_fingerprint", None))
                 code_text = (
                     out.get("code_text")
@@ -588,41 +850,33 @@ class Plan:
                     or None
                 )
 
-                # 写回
                 setattr(t, "prep_fingerprint", fp)
                 setattr(t, "code_text", code_text)
+                setattr(t, "_code_segments", out)
                 node.task = t
 
-        # ---------- Step 2: 处理指纹继承 ----------
+        # Step 2: 指纹继承
         for root in self.roots:
             rt = root.task
             root_fp = getattr(rt, "prep_fingerprint", None)
             if root_fp is None:
-                raise RuntimeError(
-                    f"Root task {getattr(rt,'name','<unnamed>')} has no prep_fingerprint after code generation."
-                )
+                raise RuntimeError(f"Root task {getattr(rt,'name','<unnamed>')} has no prep_fingerprint after code generation.")
 
             for node in self._traverse_nodes([root], order=order):
                 t = node.task
                 if_reprep = bool(getattr(t, "if_reprep", False))
 
                 if if_reprep:
-                    # 自行准备的节点必须自带 fingerprint
                     if getattr(t, "prep_fingerprint", None) is None:
-                        raise RuntimeError(
-                            f"Task {getattr(t,'name','<unnamed>')} is if_reprep=True but has no prep_fingerprint."
-                        )
+                        raise RuntimeError(f"Task {getattr(t,'name','<unnamed>')} is if_reprep=True but has no prep_fingerprint.")
                     continue
 
-                # 非 if_reprep：必须继承根指纹
                 if getattr(t, "prep_fingerprint", None) != root_fp:
                     new_t = t.copy_with(prep_fingerprint=root_fp)
-                    # 双保险：若 copy_with 过滤了字段，则手动写回
                     if getattr(new_t, "prep_fingerprint", None) != root_fp:
                         setattr(new_t, "prep_fingerprint", root_fp)
                     node.task = new_t
 
-            # ---------- Step 3: 校验一致性 ----------
             if strict:
                 bad = []
                 for node in self._traverse_nodes([root], order=order):
@@ -632,13 +886,11 @@ class Plan:
                             bad.append(getattr(t, "name", "<unnamed>"))
 
                 if bad:
-                    # 再尝试修复一次
                     for node in self._traverse_nodes([root], order=order):
                         t = node.task
                         if getattr(t, "name", None) in bad:
                             setattr(t, "prep_fingerprint", root_fp)
 
-                    # 再次校验
                     bad2 = [
                         getattr(t, "name", "<unnamed>")
                         for node in self._traverse_nodes([root], order=order)
@@ -649,49 +901,144 @@ class Plan:
 
                     if bad2:
                         raise RuntimeError(
-                            f"Tree rooted at {getattr(rt,'name','<unnamed>')} has non-inherited fingerprints: "
-                            + ", ".join(bad2)
+                            f"Tree rooted at {getattr(rt,'name','<unnamed>')} has non-inherited fingerprints: " + ", ".join(bad2)
                         )
 
         return self
 
     # ---------------------------
-    # 按照树来生成代码
+    # output_r_code_by_tree（CodeExecutor.run 依赖这个，必须存在）
     # ---------------------------
+
     def output_r_code_by_tree(
-            self,
-            include_prepare: bool = True,      # 开关仍保留；若你始终需要按规则渲染，可传 True（默认）
-            with_headers: bool = True,
-            collect_dependencies: bool = True,
-            on_missing_prepare: str = "comment",  # "comment" | "raise"
-        ) -> List[Dict[str, Any]]:
+        self,
+        include_prepare: bool = True,
+        with_headers: bool = True,
+        collect_dependencies: bool = True,
+        on_missing_prepare: str = "comment",
+        *,
+        selection_excel: str = "reg_monkey_task_selection.xlsx",
+        selection_mark_col: str = "emit_r_code",
+    ) -> List[Dict[str, Any]]:
         """
-        生成每棵任务树的 R 代码脚本与节点代码（写回到 task.code_text）并返回汇总结构。
+        按任务树输出 R 代码（仅输出 active=True 的任务）。
 
-        规则更新：
-        1) active 属性仅控制是否包含 execution_code：
-        - active=True  -> 输出 execution_code（以及 post_regression_code）
-        - active=False -> 不输出 execution_code（也不输出 post_regression_code）
-
-        2) if_reprep 控制是否包含 prepare_code，以下三种情况需要渲染（均采用“当前任务”的参数来渲染）：
-        - 当前任务为该任务树的第一个任务（无论 if_reprep / active）
-        - 当前任务 if_reprep=True
-        - 上一个任务 if_reprep=True（对“当前任务”重新渲染 prepare_code）
-        其余情况不渲染 prepare_code。
-
-        说明：
-        - “采用当前任务的参数进行 prepare_code 渲染” => 使用当前 task.generate_code() 得到的 prepare_code 片段。
+        Excel 选择逻辑（修复版）：
+        - 优先使用复合键 (parent_task_id, task_id) 来精确点选任务，避免同 task_id 在不同树被误激活。
+        - 若 Excel 缺少 parent_task_id 列，则降级为仅 task_id 匹配（兼容旧表）。
         """
+
+        try:
+            self.assign_data_contexts()
+        except Exception:
+            pass
 
         def _is_active(t: Any) -> bool:
             return bool(getattr(t, "active", getattr(t, "enabled", True)))
 
-        def _need_prepare(idx: int, tasks: List[Any]) -> bool:
-            if idx == 0:
+        def _need_prepare_between(prev_task: Any | None, cur_task: Any) -> bool:
+            ctx = getattr(cur_task, "_data_context", None)
+            if isinstance(ctx, dict):
+                return bool(ctx.get("output_data_variable"))
+            if prev_task is None:
                 return True
-            cur = bool(getattr(tasks[idx], "if_reprep", False))
-            prev = bool(getattr(tasks[idx - 1], "if_reprep", False))
+            cur = bool(getattr(cur_task, "if_reprep", False))
+            prev = bool(getattr(prev_task, "if_reprep", False))
             return cur or prev
+
+        def _norm_id(v: Any) -> str:
+            """
+            把 None/NaN/空白统一成 ''；其他转成 str 并 strip。
+            """
+            try:
+                # pandas NaN
+                import pandas as pd  # type: ignore
+                if v is None or (isinstance(v, float) and v != v) or (hasattr(pd, "isna") and pd.isna(v)):
+                    return ""
+            except Exception:
+                if v is None:
+                    return ""
+            s = str(v)
+            return s.strip()
+
+        def _apply_excel_selection_if_any() -> None:
+            """
+            读取选择表并就地更新各 task.active：
+            - 如果表中存在 parent_task_id + task_id + emit_r_code：使用复合键匹配
+            - 否则如果只有 task_id + emit_r_code：降级用 task_id 匹配
+            - 如果没有任何选中行：不覆盖现有 active
+            """
+            try:
+                import pandas as pd
+                from pathlib import Path
+
+                fp = Path(selection_excel)
+                if not fp.is_absolute():
+                    fp = Path.cwd() / fp
+                if not fp.exists():
+                    return
+
+                df = pd.read_excel(fp)
+
+                # 必要字段检查：task_id + mark
+                if "task_id" not in df.columns or selection_mark_col not in df.columns:
+                    return
+
+                # 选中：mark 非空（NaN/None/空白字符串都算未选）
+                mark = df[selection_mark_col]
+                mark_non_empty = mark.notna() & (mark.astype(str).str.strip() != "")
+                df_sel = df.loc[mark_non_empty].copy()
+                if df_sel.empty:
+                    return
+
+                has_parent = "parent_task_id" in df_sel.columns
+
+                # 生成选中集合：优先复合键，否则降级为 task_id
+                if has_parent:
+                    active_pairs = set(
+                        (
+                            _norm_id(p),
+                            _norm_id(tid),
+                        )
+                        for p, tid in zip(df_sel["parent_task_id"], df_sel["task_id"])
+                    )
+                    # 若表里 parent_task_id 都是空，active_pairs 可能退化；这种情况也没必要覆盖
+                    if not active_pairs:
+                        return
+                else:
+                    active_task_ids = set(_norm_id(tid) for tid in df_sel["task_id"])
+                    if not active_task_ids:
+                        return
+
+                # 强制覆盖：先全体 inactive，再激活选中项
+                for root in getattr(self, "roots", []) or []:
+                    for node in self._traverse_nodes([root], order="dfs"):
+                        t = getattr(node, "task", None)
+                        if t is None:
+                            continue
+
+                        tid = _norm_id(getattr(t, "task_id", None))
+                        pid = _norm_id(getattr(t, "parent_task_id", None))
+
+                        if has_parent:
+                            is_on = (pid, tid) in active_pairs
+                        else:
+                            is_on = tid in active_task_ids
+
+                        try:
+                            setattr(t, "active", is_on)
+                        except Exception:
+                            try:
+                                setattr(t, "enabled", is_on)
+                            except Exception:
+                                pass
+
+            except Exception:
+                # 读取/解析失败时，不影响原逻辑
+                return
+
+        # 1) 先按 Excel 点选覆盖 active（如果有）
+        _apply_excel_selection_if_any()
 
         results: List[Dict[str, Any]] = []
         trees: List[List[Any]] = self.flatten_by_tree() or []
@@ -701,42 +1048,60 @@ class Plan:
                 results.append({"tree_id": None, "r_script": "", "nodes": [], "deps": []})
                 continue
 
-            # 1) 预取并缓存所有节点的 generate_code() 结果（避免重复调用/副作用）
-            code_cache: List[Dict[str, Any]] = []
+            # 输出前再兜底规范化一次
             for t in tasks:
+                try:
+                    _normalize_task_varnames_inplace(t)
+                except Exception:
+                    pass
+
+            # 2) 只保留 active 任务（执行/输出都只针对它们）
+            active_tasks = [t for t in tasks if _is_active(t)]
+
+            if not active_tasks:
+                first_task_id = getattr(tasks[0], "task_id", None)
+                results.append({"tree_id": first_task_id, "r_script": "", "nodes": [], "deps": []})
+                continue
+
+            # 3) 缓存每个 active task 的 codegen 结果（避免重复 generate_code）
+            code_cache: List[Dict[str, Any]] = []
+            for t in active_tasks:
                 obj = t.generate_code() or {}
-                code_cache.append({
-                    "prepare_code": (obj.get("prepare_code") or "").strip(),
-                    "execute_code": (obj.get("execute_code") or "").strip(),
-                    "post_regression_code": (obj.get("post_regression_code") or "").strip(),
-                    "combined":     (obj.get("combined") or "").strip(),
-                    "dependencies": list(obj.get("dependencies") or []),
-                })
+                setattr(t, "_code_segments", obj)
+                code_cache.append(
+                    {
+                        "prepare_code": (obj.get("prepare_code") or "").strip(),
+                        "execute_code": (obj.get("execute_code") or "").strip(),
+                        "post_regression_code": (obj.get("post_regression_code") or "").strip(),
+                        "combined": (obj.get("combined") or "").strip(),
+                        "dependencies": list(obj.get("dependencies") or []),
+                    }
+                )
 
             first_task_id = getattr(tasks[0], "task_id", None)
             deps_set = set()
             script_parts: List[str] = []
 
-            # 2) 逐节点装配（只使用缓存，不在此处再次 generate）
-            for idx, task in enumerate(tasks):
+            prev_active: Any | None = None
+            for idx, task in enumerate(active_tasks):
                 cached = code_cache[idx]
-                prep   = cached["prepare_code"]
-                body   = cached["execute_code"] or cached["combined"]
-                post   = cached["post_regression_code"]
+                prep = cached["prepare_code"]
+                body = cached["execute_code"] or cached["combined"]
+                post = cached["post_regression_code"]
 
-                # 收集依赖
                 if collect_dependencies:
                     for d in cached["dependencies"]:
                         if d:
                             deps_set.add(d)
 
                 node_chunks: List[str] = []
-                # ---- prepare_code 条件渲染（永远使用“当前任务”的 prepare_code）----
-                if include_prepare and _need_prepare(idx, tasks):
+
+                # prepare：仅在 active 任务之间需要时输出
+                if include_prepare and _need_prepare_between(prev_active, task):
                     if prep:
                         if with_headers:
                             header = f"# ---- [prep] {getattr(task, 'name', f'task_{idx}')}"
-                            model  = getattr(task, "model", "") or getattr(task, "note", "")
+                            model = getattr(task, "model", "") or getattr(task, "note", "")
                             header = header + (f" ({model})" if model else "") + " ----\n"
                             node_chunks.append(header + prep)
                         else:
@@ -747,238 +1112,265 @@ class Plan:
                             raise RuntimeError(msg)
                         node_chunks.append(msg)
 
-                # ---- execution_code 受 active 控制 ----
-                if _is_active(task):
-                    if body:
-                        if with_headers:
-                            label = getattr(task, "name", "")
-                            meta  = getattr(task, "model", "") or getattr(task, "note", "")
-                            header = f"#----------------{label}" + (f" ({meta})" if meta else "") + " ----------------#\n"
-                            node_chunks.append(header + body)
-                        else:
-                            node_chunks.append(body)
-                    # post_regression_code 仅在 active=True 时输出
-                    if post:
-                        node_chunks.append(post)
-                else:
-                    # inactive：严格不输出 execution_code / post_regression_code
-                    pass
+                # execute + post
+                if body:
+                    if with_headers:
+                        label = getattr(task, "name", "")
+                        meta = getattr(task, "model", "") or getattr(task, "note", "")
+                        header = f"#----------------{label}" + (f" ({meta})" if meta else "") + " ----------------#\n"
+                        node_chunks.append(header + body)
+                    else:
+                        node_chunks.append(body)
+                if post:
+                    node_chunks.append(post)
 
                 node_text = "\n".join([b for b in node_chunks if b and b.strip()]).strip()
                 setattr(task, "code_text", node_text)
                 if node_text:
                     script_parts.append(node_text)
 
+                prev_active = task
+
             r_script = "\n\n".join(script_parts).strip()
-            results.append({
-                "tree_id": first_task_id,
-                "r_script": r_script,
-                "nodes": tasks,                               # 已将各节点 code_text 写回
-                "deps": sorted(deps_set) if collect_dependencies else [],
-            })
+            results.append(
+                {
+                    "tree_id": first_task_id,
+                    "r_script": r_script,
+                    "nodes": active_tasks,
+                    "deps": sorted(deps_set) if collect_dependencies else [],
+                }
+            )
 
         return results
-
+        
     # ---------------------------
-    # 添加 _map_roots 方法
+    # _map_roots
     # ---------------------------
-    def _map_roots(self, fn: Callable[[TaskNode], None]) -> 'Plan':
+    def _map_roots(self, fn: Callable[[TaskNode], None]) -> "Plan":
         for root in self.roots:
             fn(root)
         return self
-    
+
     # ---------------------------
-    # 添加 evaluate_acceptance_over_forest 方法
+    # evaluate_acceptance_over_forest（保留）
     # ---------------------------
     def evaluate_acceptance_over_forest(
-        self,
-        *,
-        order: Literal["dfs", "bfs"] = "dfs"
-    ) -> List[Dict[str, Any]]:
-        """
-        遍历所有任务树，对每个节点调用 task.evaluate_acceptance(alpha) 进行“能否被接受”的判断，
-        并根据显著性水平返回星标：
-            - 传入 0.01 返回 True  -> "***"
-            - 传入 0.05 返回 True  -> "**"
-            - 传入 0.10 返回 True  -> "*"
-        规则：
-          1) 对所有 name 以 'baseline' 开头的 StandardRegTask，仅使用 self.cfg.significance_level 判定一次；
-             若通过，则按该 alpha 映射星标（若 alpha 不在 {0.01,0.05,0.1}，则按阈值：<=0.01→***，<=0.05→**，<=0.1→*）。
-          2) 其余任务依次尝试 alpha ∈ {0.01, 0.05, 0.10}，取最严格（最小 alpha）即刻通过的结果并返回相应星标。
-          3) 若均不通过，则标记为空字符串 ""，accepted=False，used_alpha=None。
+            self,
+            *,
+            order: Literal["dfs", "bfs"] = "dfs",
+        ) -> List[Dict[str, Any]]:
 
-        返回：
-          List[dict]，每个元素包含：
-            {
-              "task_id": str | None,
-              "name": str,
-              "section": str,
-              "accepted": bool,
-              "used_alpha": float | None,
-              "mark": str,        # "***" / "**" / "*" / ""(未通过)
-            }
-        """
-        def _alpha_to_mark(alpha: float) -> str:
-            # 精确匹配优先；否则按阈值就近映射
-            exact = {0.01: "***", 0.05: "**", 0.1: "*"}
-            if alpha in exact:
-                return exact[alpha]
-            if alpha <= 0.01:
-                return "***"
-            if alpha <= 0.05:
-                return "**"
-            if alpha <= 0.10:
-                return "*"
-            return ""  # 超过 0.10 不给星
+            def _alpha_to_mark(alpha: float) -> int:
+                """根据p-value返回显著性等级"""
+                if alpha <= 0.01:
+                    return 3
+                if alpha <= 0.05:
+                    return 2
+                if alpha <= 0.10:
+                    return 1
+                return 0
 
-        results: List[Dict[str, Any]] = []
+            def _evaluate_single_result(exec_result_dict: Dict, X_vars: List[str]) -> Dict[str, int]:
+                """
+                评估单个回归结果（forward_res或opposite_res）
+                
+                参数:
+                    exec_result_dict: {'coefficients': DataFrame, ...}
+                    X_vars: 自变量名称列表
+                
+                返回:
+                    {变量名: 显著性等级（带符号）}
+                """
+                if exec_result_dict is None:
+                    return None
+                
+                if not isinstance(exec_result_dict, dict):
+                    return None
+                
+                coefficients_df = exec_result_dict.get('coefficients')
+                if coefficients_df is None:
+                    return None
+                
+                result = {}
+                
+                for var in X_vars:
+                    # 在coefficients DataFrame中查找该变量
+                    mask = coefficients_df['Variable'] == var
+                    if not mask.any():
+                        # 变量不在结果中，跳过
+                        continue
+                    
+                    row = coefficients_df[mask].iloc[0]
+                    coefficient = row['Estimate']
+                    p_value = row['P_Value']
+                    
+                    # 计算显著性等级
+                    significance = _alpha_to_mark(p_value)
+                    
+                    # 根据系数符号调整
+                    if coefficient < 0:
+                        significance = -significance
+                    
+                    result[var] = significance
+                
+                return result
 
-        # 遍历每棵树
-        for root in self.roots:
-            for node in self._traverse_nodes([root], order=order):
-                t = getattr(node, "task", None)
-                if t is None:
-                    continue
+            results: List[Dict[str, Any]] = []
 
-                eval_fn = getattr(t, "evaluate_acceptance", None)
-                if not callable(eval_fn):
-                    # 没有该接口：视为不可判定
+            for root in self.roots:
+                for node in self._traverse_nodes([root], order=order):
+                    t = getattr(node, "task", None)
+                    if t is None:
+                        continue
+
+                    # 获取exec_result和X字段
+                    exec_result = getattr(t, "exec_result", None)
+                    X = getattr(t, "X", None)
+                    
+                    # 确保X是列表格式
+                    if isinstance(X, str):
+                        X_vars = [X]
+                    elif isinstance(X, list):
+                        X_vars = X
+                    else:
+                        X_vars = []
+                    
+                    # 初始化评估结果
+                    evaluation_result = {
+                        "forward_res": None,
+                        "opposite_res": None
+                    }
+                    
+                    # 如果有exec_result，进行评估
+                    if exec_result is not None:
+                        # 处理OpaqueExecResult包装
+                        if hasattr(exec_result, 'value'):
+                            exec_result = exec_result.value
+                        
+                        if isinstance(exec_result, dict):
+                            # 评估forward_res
+                            forward_res = exec_result.get('forward_res')
+                            if forward_res is not None:
+                                evaluation_result['forward_res'] = _evaluate_single_result(forward_res, X_vars)
+                            
+                            # 评估opposite_res
+                            opposite_res = exec_result.get('opposite_res')
+                            if opposite_res is not None:
+                                evaluation_result['opposite_res'] = _evaluate_single_result(opposite_res, X_vars)
+
                     results.append({
+                        "parent_task_id": getattr(t, "parent_task_id", None),
                         "task_id": getattr(t, "task_id", None),
                         "name": getattr(t, "name", "<unnamed>"),
                         "section": getattr(node, "section", ""),
-                        "accepted": False,
-                        "used_alpha": None,
-                        "mark": "",
+                        "accepted": evaluation_result.get('forward_res') is not None,  # 如果有forward结果就算accepted
+                        "mark": evaluation_result,  # 将完整的评估结果存在mark字段
                     })
-                    continue
+            
+            return results
+        # ---------------------------
+        # to_materialize（✅ merge key = task_id + section；✅ exec_result 保留结构但可安全打印）
+        # ---------------------------
 
-                name = str(getattr(t, "name", "")) if getattr(t, "name", None) is not None else ""
-                is_baseline = name.startswith("baseline")
+    def to_materialize(self,output_file_name='reg_monkey_task_selection.xlsx',output_to_file=False):
+            import pandas as pd
 
-                used_alpha: Optional[float] = None
-                accepted: bool = False
-                mark: str = ""
+            task_cols = [
+                "parent_task_id",
+                "task_id",
+                "name",
+                "dataset",
+                "model",
+                "y",
+                "X",
+                "controls",
+                "category_controls",
+                "category_controls_mapping",
+                "panel_ids",
+                "exec_result",
+                "code_text",
+                "subset",
+                "if_reprep",
+                "active",
+                "emit_r_code"
+            ]
 
-                if is_baseline:
-                    # 1) baseline：仅用 self.cfg.significance_level
-                    cfg = getattr(self, "cfg", None)
-                    alpha = getattr(cfg, "significance_level", None) if cfg is not None else None
-
-                    # 若缺失 cfg 或 significance_level，就保守地不通过并返回空标记
-                    if isinstance(alpha, (int, float)):
-                        try:
-                            ok = bool(eval_fn(float(alpha)))
-                        except Exception:
-                            ok = False
-                        used_alpha = float(alpha)
-                        accepted = ok
-                        mark = _alpha_to_mark(used_alpha) if ok else ""
-                    else:
-                        used_alpha = None
-                        accepted = False
-                        mark = ""
-                else:
-                    # 2) 非 baseline：依次试 0.01、0.05、0.1，取最先通过者
-                    for a in (0.01, 0.05, 0.10):
-                        try:
-                            ok = bool(eval_fn(a))
-                        except Exception:
-                            ok = False
-                        if ok:
-                            used_alpha = a
-                            accepted = True
-                            mark = _alpha_to_mark(a)  # 题述中三档的直接映射
-                            break
-
-                results.append({
-                    "task_id": getattr(t, "task_id", None),
-                    "name": name or "<unnamed>",
-                    "section": getattr(node, "section", ""),
-                    "accepted": accepted,
-                    "used_alpha": used_alpha,
-                    "mark": mark,
-                })
-        return results
-
-    def to_materialize(self):
-        """
-        将所有任务树平铺成一张 pandas.DataFrame，并与 evaluate_acceptance_over_forest 的结果左连接。
-        返回列顺序：
-        ['task_id','name','dataset','section','model','y','X','controls','category_controls',
-         'panel_ids','exec_result','subset','if_reprep','active','mark']
-        """
-        import pandas as pd
-
-        # 需要抽取的任务属性
-        task_cols = [
-            'task_id', 'name', 'dataset', 'model', 'y', 'X',
-            'controls', 'category_controls', 'panel_ids',
-            'exec_result', 'subset', 'if_reprep', 'active'
-        ]
-
-        # 某些字段里可能塞了生成器/迭代器/自定义可迭代对象，pandas 在 pretty print 时会尝试遍历它们，导致 StopIteration。
-        # 为避免打印阶段崩溃，把“非基础类型”的值序列化为 repr 字符串。
-        def _sanitize(v):
-            if v is None or isinstance(v, (str, int, float, bool)):
+            def _safe_cell(v: Any) -> Any:
+                # exec_result：保留结构但包装一下，避免 pandas pretty 崩
+                if isinstance(v, dict) and ("forward_res" in v or "opposite_res" in v):
+                    return OpaqueExecResult(v)
                 return v
-            try:
-                return repr(v)
-            except Exception:
-                return f"<unrepr {type(v).__name__}>"
 
-        rows = []
+            base_cols = [
+                "parent_task_id",
+                "task_id",
+                "name",
+                "dataset",
+                "model",
+                "y",
+                "X",
+                "controls",
+                "category_controls",
+                "category_controls_mapping",
+                "panel_ids",
+                "exec_result",
+                "subset",
+                "if_reprep",
+                "active",
+                "emit_r_code"
+            ]
+            final_cols = base_cols + ["section", "mark"]
 
-        # 统一遍历节点（优先用类里已有的遍历器）
-        def _iter_nodes():
-            if hasattr(self, "_traverse_nodes"):
-                for r in getattr(self, "roots", []):
-                    for n in self._traverse_nodes([r], order="dfs"):
-                        yield n
-            else:
-                stack = list(getattr(self, "roots", []))[::-1]
-                while stack:
-                    n = stack.pop()
-                    yield n
-                    children = getattr(n, "children", []) or []
-                    stack.extend(reversed(children))
-        for node in _iter_nodes():
-            t = getattr(node, "task", None)
-            if t is None:
-                continue
-            rec = {}
-            for c in task_cols:
-                rec[c] = _sanitize(getattr(t, c, None))
-            rec['section'] = _sanitize(getattr(node, 'section', None))
-            rows.append(rec)
-        base_cols = [
-            'task_id', 'name', 'dataset', 'model', 'y', 'X',
-            'controls', 'category_controls', 'panel_ids',
-            'exec_result', 'subset', 'if_reprep', 'active'
-        ]
-        final_cols = base_cols + ['mark']
-        if not rows:
-            return pd.DataFrame(columns=final_cols)
-        df = pd.DataFrame(rows)
-        # 评估并左连接（仅按 task_id）
-        if not hasattr(self, 'evaluate_acceptance_over_forest'):
-            raise AttributeError("evaluate_acceptance_over_forest 方法不存在，请先实现。")
-        acc_list = self.evaluate_acceptance_over_forest(order="dfs")
-        acc_df = pd.DataFrame(acc_list) if acc_list else pd.DataFrame(columns=['task_id', 'section', 'mark'])
-        for need in ['task_id', 'section', 'mark']:
-            if need not in acc_df.columns:
-                acc_df[need] = pd.NA
-        acc_df = acc_df[['task_id', 'section', 'mark']]
-        merged = df.merge(acc_df, on=['task_id'], how='left', suffixes=('', '_acc'))
-        # 如果评估结果里有 section，可用其覆盖（仅在评估有值时）
-        if 'section_acc' in merged.columns:
-            merged['section'] = merged['section_acc'].combine_first(merged['section'])
-            merged = merged.drop(columns=['section_acc'])
-        # 补全并按顺序返回
-        for c in base_cols:
-            if c not in merged.columns:
-                merged[c] = pd.NA
-        if 'mark' not in merged.columns:
-            merged['mark'] = pd.NA
-        return merged[final_cols]
-__all__ = ['Plan']
+            # ✅ 新方案：每棵树单独处理，然后纵向合并
+            tree_dfs = []
+            
+            for root in getattr(self, "roots", []):
+                rows = []
+                # 1. 遍历当前树收集任务数据
+                for node in self._traverse_nodes([root], order="dfs"):
+                    t = getattr(node, "task", None)
+                    if t is None:
+                        continue
+                    rec = {}
+                    for c in task_cols:
+                        rec[c] = _safe_cell(getattr(t, c, None))
+                    rec["section"] = getattr(node, "section", None)
+                    rows.append(rec)
+                
+                if not rows:
+                    continue
+                
+                # 当前树的DataFrame
+                tree_df = pd.DataFrame(rows)
+                
+                # 2. 调用evaluate_acceptance_over_forest获取当前树的acceptance结果
+                # 创建临时Plan对象，只包含当前树
+                temp_plan = object.__new__(Plan)
+                temp_plan.roots = [root]
+                temp_plan.cfg = getattr(self, "cfg", None)
+                
+                tree_acc_list = temp_plan.evaluate_acceptance_over_forest(order="dfs")
+                
+                # 3. 当前树内部merge（不会产生重复）
+                tree_acc_df = pd.DataFrame(tree_acc_list) if tree_acc_list else pd.DataFrame(columns=["parent_task_id", "task_id", "section", "mark"])
+                for need in ["parent_task_id", "task_id", "section", "mark"]:
+                    if need not in tree_acc_df.columns:
+                        tree_acc_df[need] = pd.NA
+                tree_acc_df = tree_acc_df[["parent_task_id", "task_id", "section", "mark"]]
+                
+                tree_merged = tree_df.merge(tree_acc_df, on=["parent_task_id", "task_id", "section"], how="left", suffixes=("", "_acc"))
+                tree_dfs.append(tree_merged)
+            
+            # 4. 纵向合并所有树的结果
+            if not tree_dfs:
+                return pd.DataFrame(columns=final_cols)
+            
+            merged = pd.concat(tree_dfs, ignore_index=True)
+            
+            for c in final_cols:
+                if c not in merged.columns:
+                    merged[c] = pd.NA
+            if output_to_file: # 如果这个入参被标记为True则输出到文件，默认为False
+                merged.drop('exec_result',errors='ignore').to_excel(output_file_name)
+            return merged[final_cols]
+__all__ = ["Plan"]

@@ -474,7 +474,7 @@ class DataManager:
                 if os.path.exists(pkl_path):
                     df_dep = self._load_pkl_compat(pkl_path)
                 else:
-                    raise FileNotFoundError(f"自依赖 PKL 未找到：{pkl_path}")
+                    raise FileNotFoundError(f"Self-referenced PKL not found: {pkl_path}")
 
             else:
                 # 2) 普通依赖：若未加载则即时加载（会按 DataLoader→Arctic→PKL 或反向策略）
@@ -492,7 +492,7 @@ class DataManager:
                             break
 
             if df_dep is None:
-                raise KeyError(f"依赖 '{dep}' 未能加载（当前 symbol='{symbol}'）。")
+                raise KeyError(f"Dependency '{dep}' failed to load (current symbol='{symbol}').")
 
             # 注入为安全属性名（去 .pkl + sanitize；数字开头加前缀）
             attr = self._canonical_attr(dep)
@@ -596,10 +596,12 @@ class DataManager:
                                 self._write_df(symbol, df, metadata=meta)  # 内部转安全名
                                 print(f"[Ingest] {self._canonical_symbol(symbol)} (from PKL) -> Arctic")
                             except Exception as e:
-                                print(f"[Warn] 写回 Arctic 失败（PKL→Arctic）：{symbol}: {e}")
+                                print(f"[Warn] Failed to write back to Arctic (PKL→Arctic): {symbol}: {e}")
                         return df
 
-        raise RuntimeError(f"未找到或无法加载同名数据集：symbol={symbol}; attempts={order}; errors={errors}")
+        raise RuntimeError(
+            f"Dataset '{symbol}' could not be found or loaded; attempts={order}; errors={errors}"
+        )
 
     def _load_symbol_readonly_arctic(self, symbol: str) -> Optional[pd.DataFrame]:
         if self._symbol_exists(symbol):
@@ -691,31 +693,31 @@ class DataManager:
 
         # 构造提示文案
         if is_short:
-            msg_head = (f"[Refresh] 估计总时长 {total_min:.1f} min ≤ 阈值 {budget_min} min。"
-                        f"将重算以下 symbol：{syms}")
-            prompt = "是否执行重算？ [y/N]: "
+            msg_head = (f"[Refresh] Estimated total duration {total_min:.1f} min ≤ budget {budget_min} min. "
+                        f"Symbols to recompute: {syms}")
+            prompt = "Run the refresh? [y/N]: "
         else:
-            msg_head = (f"[Refresh] 估计总时长 {total_min:.1f} min > 阈值 {budget_min} min。"
-                        f"将重算以下 symbol：{syms}")
-            prompt = "是否【强制】重算？ [y/N/f]: "
+            msg_head = (f"[Refresh] Estimated total duration {total_min:.1f} min > budget {budget_min} min. "
+                        f"Symbols to recompute: {syms}")
+            prompt = "Force the refresh? [y/N/f]: "
 
         # 3) 非交互模式兜底（CI/脚本环境）
         if non_interactive:
             if is_short:
                 if self.auto_approve_short:
-                    print(f"{msg_head}\n[Refresh] 非交互模式：≤ 阈值，auto_approve_short=1 → 执行。")
+                    print(f"{msg_head}\n[Refresh] Non-interactive mode: ≤ budget, auto_approve_short=1 → execute.")
                     return True, 'auto'
                 else:
-                    print(f"{msg_head}\n[Refresh] 非交互模式：≤ 阈值，未配置自动通过 → 跳过。")
+                    print(f"{msg_head}\n[Refresh] Non-interactive mode: ≤ budget, no auto-approve configured → skip.")
                     return False, 'user_no'
             else:
                 if self.force_when_long:
-                    print(f"{msg_head}\n[Refresh] 非交互模式：> 阈值，force_when_long=1 → 强制执行。")
+                    print(f"{msg_head}\n[Refresh] Non-interactive mode: > budget, force_when_long=1 → force execute.")
                     return True, 'auto'
                 if not self.auto_decline_long:
-                    print(f"{msg_head}\n[Refresh] 非交互模式：> 阈值，auto_decline_long=0 但无交互 → 跳过。")
+                    print(f"{msg_head}\n[Refresh] Non-interactive mode: > budget, auto_decline_long=0 but no input available → skip.")
                     return False, 'user_no'
-                print(f"{msg_head}\n[Refresh] 非交互模式：> 阈值，默认跳过。")
+                print(f"{msg_head}\n[Refresh] Non-interactive mode: > budget, skipping by default.")
                 return False, 'user_no'
 
         # 4) 交互式确认（优先尝试 input；若失败再按兜底策略）
@@ -816,7 +818,7 @@ class DataManager:
                                     self._write_df(s, df, metadata=meta)
                                     print(f"[Ingest] {self._canonical_symbol(s)} (fallback PKL) -> Arctic")
                                 except Exception as e:
-                                    print(f"[Warn] 写回 Arctic 失败（fallback PKL→Arctic）：{s}: {e}")
+                                    print(f"[Warn] Failed to write back to Arctic (fallback PKL→Arctic): {s}: {e}")
 
     # ---------------------------- 一次性强刷入口 -----------------------------
     def _read_manual_refresh_symbols(self, all_symbols: Set[str]) -> Set[str]:
@@ -1004,10 +1006,10 @@ class DataManager:
 
         lines: List[str] = []
         if not os.path.exists(target_dir):
-            return f"[ERR] data 目录不存在：{target_dir}"
+            return f"[ERR] data directory does not exist: {target_dir}"
 
         uri = f"lmdb://{target_dir}"
-        lines.append(f"[INFO] 连接 ArcticDB：{uri}")
+        lines.append(f"[INFO] Connecting to ArcticDB: {uri}")
 
         # ✅ 优先复用：1) 当前实例已打开且路径一致
         store = None
@@ -1035,7 +1037,7 @@ class DataManager:
                 store = Arctic(uri)
                 created_here = True
             except Exception as e:
-                out = "\n".join(lines + [f"[ERR] 无法连接 ArcticDB：{uri}，原因：{e}"])
+                out = "\n".join(lines + [f"[ERR] Failed to connect to ArcticDB: {uri}, reason: {e}"])
                 print(out)
                 return out
 
@@ -1043,11 +1045,11 @@ class DataManager:
         try:
             libraries = list(store.list_libraries())
         except Exception as e:
-            lines.append(f"[WARN] 无法列出库（list_libraries 失败）：{e}")
+            lines.append(f"[WARN] Failed to list libraries (list_libraries error): {e}")
             libraries = []
 
         if not libraries:
-            lines.append("[INFO] 未检测到库。请确认库是否已创建，以及当前进程未重复打开同一路径。")
+            lines.append("[INFO] No libraries detected. Ensure a library has been created and this process has not opened the same path twice.")
             if created_here:
                 try:
                     if hasattr(store, "close"):
@@ -1063,17 +1065,17 @@ class DataManager:
             try:
                 lib = store[lib_name]
             except Exception as e:
-                lines.append(f"[ERR] 无法打开库 {lib_name}: {e}")
+                lines.append(f"[ERR] Failed to open library {lib_name}: {e}")
                 continue
 
             try:
                 symbols = list(lib.list_symbols())
             except Exception as e:
-                lines.append(f"[ERR] 无法列出库 {lib_name} 的 symbols: {e}")
+                lines.append(f"[ERR] Failed to list symbols for library {lib_name}: {e}")
                 continue
 
             if not symbols:
-                lines.append("  (空库，无 symbol)")
+                lines.append("  (empty library, no symbols)")
                 continue
 
             for sym in sorted(symbols):
@@ -1107,7 +1109,7 @@ class DataManager:
                     lines.append(f"    metadata keys : {list(meta.keys())}" if meta else f"    metadata      : {{}}")
 
                 except Exception as e:
-                    lines.append(f"  [ERR] 读取 symbol '{sym}' 失败：{e}")
+                    lines.append(f"  [ERR] Failed to read symbol '{sym}': {e}")
 
         # 如果是本函数新建的 store，尽力关闭；复用的不要关（交给引用计数/持有者）
         if created_here:

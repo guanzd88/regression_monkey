@@ -1,0 +1,155 @@
+/* Output Mapping TUI 全局样式 */
+
+/* ========== 全局 ========== */
+Screen {
+    background: $surface;
+}
+
+/* ========== 标题栏 ========== */
+.title-bar {
+    height: 1;
+    background: $primary;
+    color: $text;
+    text-align: center;
+    text-style: bold;
+}
+
+/* ========== 操作栏 ========== */
+.action-bar {
+    height: 1;
+    background: $surface-darken-1;
+    padding: 0 1;
+}
+
+/* ========== 状态栏 ========== */
+.status-bar {
+    height: 1;
+    background: $surface-darken-2;
+    padding: 0 1;
+}
+
+/* ========== 表格样式 ========== */
+DataTable {
+    height: 1fr;
+}
+
+DataTable > .datatable--cursor {
+    background: $primary-darken-1;
+}
+
+DataTable > .datatable--header {
+    text-style: bold;
+    background: $surface-darken-1;
+}
+
+/* ========== 对话框样式 ========== */
+ModalScreen {
+    align: center middle;
+}
+
+.dialog {
+    width: auto;
+    height: auto;
+    border: thick $primary;
+    background: $surface;
+    padding: 1 2;
+}
+
+.dialog-title {
+    text-align: center;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+.dialog-message {
+    text-align: center;
+    margin: 1 0;
+}
+
+.form-row {
+    height: 3;
+    margin-bottom: 1;
+}
+
+.form-row Label {
+    width: 15;
+}
+
+.form-row Input {
+    width: 1fr;
+}
+
+.button-row {
+    height: 3;
+    align: center middle;
+    margin-top: 1;
+}
+
+.button-row Button {
+    margin: 0 1;
+}
+
+/* ========== 筛选栏 ========== */
+.filter-bar {
+    height: 3;
+    padding: 0 1;
+    background: $surface-darken-1;
+}
+
+.filter-bar Input {
+    width: 1fr;
+}
+
+.filter-bar Select {
+    width: 15;
+    margin-left: 1;
+}
+
+/* ========== 预览区域 ========== */
+.preview-container {
+    border: solid $primary;
+    margin: 1;
+    padding: 1;
+    overflow-y: auto;
+}
+
+.preview-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+/* ========== 帮助样式 ========== */
+.section-title {
+    text-style: bold;
+    color: $primary;
+    margin-top: 1;
+}
+
+.detail-row {
+    margin-left: 2;
+}
+
+/* ========== Mark 颜色 ========== */
+.mark-pass {
+    color: $success;
+}
+
+.mark-fail {
+    color: $error;
+}
+
+.mark-none {
+    color: $text-muted;
+}
+
+/* ========== 选中状态 ========== */
+.selected {
+    background: $success-darken-2;
+}
+
+/* ========== 空状态 ========== */
+.empty-message {
+    height: 1fr;
+    content-align: center middle;
+    color: $text-muted;
+}
