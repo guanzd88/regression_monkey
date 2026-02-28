@@ -117,7 +117,7 @@ class TableEditorScreen(BaseScreen):
     def on_mount(self) -> None:
         table = self.query_one("#column_list", DataTable)
         table.cursor_type = "row"
-        table.add_columns("#", "Label", "Task ID", "Y", "X", "Model")
+        table.add_columns("#", "Label", "Parent", "Task ID", "Y", "X", "Model")
         self._refresh_columns()
         self._refresh_preview()
         self._update_action_bar()
@@ -143,6 +143,7 @@ class TableEditorScreen(BaseScreen):
             table.add_row(
                 str(idx + 1),
                 col.label or f"({idx + 1})",
+                self._truncate(col.parent_task_id or "", 15),
                 self._truncate(col.task_id, 20),
                 col.y,
                 self._format_X(col.X),
@@ -317,7 +318,7 @@ class TableEditorScreen(BaseScreen):
                 self._refresh_preview()
                 self._update_status()
                 self.post_message(
-                    ColumnDeleted(table_index, col.task_id)
+                    ColumnDeleted(table_index, col.task_id, col.parent_task_id)
                 )
                 self.notify_user("Column deleted")
 
@@ -339,7 +340,8 @@ class TableEditorScreen(BaseScreen):
             idx = self._get_selected_index()
             matrix = self.current_table
             if idx is not None and matrix:
-                matrix.rename_column(matrix.columns[idx].task_id, new_label)
+                col = matrix.columns[idx]
+                matrix.rename_column(col.task_id, new_label, col.parent_task_id)
                 self.shared_state.mark_dirty()
                 self._refresh_columns()
                 self._refresh_preview()
