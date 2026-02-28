@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 from textual.message import Message
 
@@ -87,11 +87,20 @@ class ColumnsAdded(Message):
 
     table_index: int
     task_ids: List[str]
+    parent_task_ids: List[Optional[str]]
 
-    def __init__(self, table_index: int, task_ids: List[str]) -> None:
+    def __init__(
+        self,
+        table_index: int,
+        task_ids: List[str],
+        parent_task_ids: Optional[List[Optional[str]]] = None,
+    ) -> None:
         super().__init__()
         self.table_index = table_index
         self.task_ids = task_ids
+        if parent_task_ids is None:
+            parent_task_ids = [None] * len(task_ids)
+        self.parent_task_ids = parent_task_ids
 
 
 @dataclass
@@ -100,11 +109,18 @@ class ColumnDeleted(Message):
 
     table_index: int
     task_id: str
+    parent_task_id: Optional[str]
 
-    def __init__(self, table_index: int, task_id: str) -> None:
+    def __init__(
+        self,
+        table_index: int,
+        task_id: str,
+        parent_task_id: Optional[str] = None,
+    ) -> None:
         super().__init__()
         self.table_index = table_index
         self.task_id = task_id
+        self.parent_task_id = parent_task_id
 
 
 @dataclass

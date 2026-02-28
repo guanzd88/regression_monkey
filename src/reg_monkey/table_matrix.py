@@ -407,7 +407,7 @@ class TableMatrix:
         return self
 
     def reorder_columns(self, task_ids: List[str]) -> "TableMatrix":
-        """按 task_id 列表重排列"""
+        """按 task_id 列表重排列 (保持向后兼容)."""
         by_id = {c.task_id: c for c in self.columns}
         ordered = [by_id[tid] for tid in task_ids if tid in by_id]
         remaining = [c for c in self.columns if c.task_id not in set(task_ids)]
@@ -415,12 +415,16 @@ class TableMatrix:
         self._renumber_labels()
         return self
 
-    def rename_column(self, task_id: str, new_label: str) -> "TableMatrix":
+    def rename_column(
+        self,
+        task_id: str,
+        new_label: str,
+        parent_task_id: Optional[str] = None,
+    ) -> "TableMatrix":
         """重命名列标签"""
-        for col in self.columns:
-            if col.task_id == task_id:
-                col.label = new_label
-                break
+        col = self.get_column(task_id, parent_task_id)
+        if col is not None:
+            col.label = new_label
         return self
 
     def _renumber_labels(self) -> None:
@@ -442,10 +446,20 @@ class TableMatrix:
     def is_empty(self) -> bool:
         return len(self.columns) == 0
 
-    def get_column(self, task_id: str) -> Optional[MatrixColumn]:
-        """按 task_id 获取列"""
+    def get_column(
+        self,
+        task_id: str,
+        parent_task_id: Optional[str] = None,
+    ) -> Optional[MatrixColumn]:
+        """按 task_id/parent_task_id 获取列"""
+        normalized_parent = (parent_task_id or None)
         for col in self.columns:
-            if col.task_id == task_id:
+            if col.task_id != task_id:
+                continue
+            if normalized_parent is None:
+                return col
+            col_parent = col.parent_task_id or None
+            if col_parent == normalized_parent:
                 return col
         return None
 

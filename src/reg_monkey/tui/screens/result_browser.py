@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
+import re
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple
 
 import pandas as pd
@@ -10,6 +12,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Footer, Header, Input, Select, Static
+from textual.widgets._input import Selection
 
 from .base import BaseScreen
 from .dialogs import TaskDetailModal, CoefficientsModal, StepwiseSelectModal
@@ -28,9 +31,13 @@ class BrowserState:
     cursor_index: int = 0  # cursor position in filtered_df
     selected_indices: Set[int] = field(default_factory=set)  # selected row indices
     search_term: str = ""  # search keyword
-    filters: dict = field(default_factory=dict)  # metadata filters
+    filters: dict = field(default_factory=dict)  # metadata filters (UI)
+    command_filters: dict = field(default_factory=dict)  # metadata filters (:filter)
     result_conditions: List[str] = field(default_factory=list)  # result condition expressions
     result_condition_logic: str = "AND"  # combination logic for result filters
+
+
+RESULT_CONDITION_PATTERN = re.compile(r"^\s*([A-Za-z_][\w]*)\s*(\([+\-*]\))?\s*(<=|>=|=|<|>)\s*(.+)$")
 
 
 class ResultBrowserScreen(BaseScreen):
@@ -55,6 +62,7 @@ class ResultBrowserScreen(BaseScreen):
         Binding("o", "preview_coefficients", "Coefficients"),
         Binding("w", "open_stepwise", "Stepwise"),
         Binding("r", "refresh", "Refresh"),
+        Binding("ctrl+shift+c", "copy_selection", "Copy"),
         Binding("escape", "go_back", "Back"),
         Binding("colon", "command_mode", "Command"),
         Binding("f1", "show_help", "Help"),
@@ -122,16 +130,6 @@ class ResultBrowserScreen(BaseScreen):
             yield Select(
                 id="section_filter",
                 options=[("All", "all")] + [(s, s) for s in self.shared_state.get_unique_sections()],
-                value="all",
-            )
-            yield Select(
-                id="name_filter",
-                options=[("All", "all")] + [(n, n) for n in self.shared_state.get_unique_names()],
-                value="all",
-            )
-            yield Select(
-                id="mark_filter",
-                options=[("All", "all"), ("pass", "pass"), ("fail", "fail"), ("-", "-")],
                 value="all",
             )
         yield DataTable(id="result_table")
@@ -223,14 +221,25 @@ class ResultBrowserScreen(BaseScreen):
             df = df[mask]
 
         # 2. 元数据下拉筛选
-        for col, value in self.browser_state.filters.items():
+        combined_filters: dict[str, Any] = {}
+        combined_filters.update(self.browser_state.command_filters)
+        combined_filters.update(self.browser_state.filters)
+
+        for col, value in combined_filters.items():
             if value and value != "all":
+                if col not in df.columns:
+                    continue
+                series = df[col].fillna("").astype(str).str.strip()
                 if isinstance(value, tuple) and value[0] == "contains":
                     # 模糊匹配
-                    df = df[df[col].astype(str).str.contains(value[1], case=False, na=False)]
+                    needle = str(value[1]).strip()
+                    if not needle:
+                        continue
+                    df = df[series.str.contains(needle, case=False, na=False)]
                 else:
                     # 精确匹配
-                    df = df[df[col].astype(str) == str(value)]
+                    target = str(value).strip()
+                    df = df[series == target]
 
         # 3. 结果条件筛选
         if self.browser_state.result_conditions:
@@ -288,7 +297,7 @@ class ResultBrowserScreen(BaseScreen):
             return
 
         # 清除旧的筛选
-        self.browser_state.filters.clear()
+        self.browser_state.command_filters.clear()
         self.browser_state.result_conditions.clear()
         self.browser_state.result_condition_logic = "AND"
 
@@ -308,29 +317,47 @@ class ResultBrowserScreen(BaseScreen):
 
             if part.startswith("result:"):
                 # 结果条件
-                condition = part[7:].strip()
+                condition = self._normalize_result_condition(part[7:].strip())
                 self.browser_state.result_conditions.append(condition)
 
             elif "=" in part:
                 # 精确匹配
                 key, value = part.split("=", 1)
-                self.browser_state.filters[key.strip()] = value.strip()
+                self.browser_state.command_filters[key.strip()] = value.strip()
 
             elif "~" in part:
                 # 模糊匹配
                 key, value = part.split("~", 1)
-                self.browser_state.filters[key.strip()] = ("contains", value.strip())
+                self.browser_state.command_filters[key.strip()] = (
+                    "contains",
+                    value.strip(),
+                )
 
             elif ":" in part and not part.startswith("result"):
                 # 包含
                 key, value = part.split(":", 1)
-                self.browser_state.filters[key.strip()] = ("contains", value.strip())
+                self.browser_state.command_filters[key.strip()] = (
+                    "contains",
+                    value.strip(),
+                )
 
             elif part:
                 # treat bare expressions as result conditions for convenience
                 self.browser_state.result_conditions.append(part)
 
         self._apply_filters()
+
+    def _normalize_result_condition(self, condition: str) -> str:
+        """缺省省略符号时自动补成 (*)。"""
+        match = RESULT_CONDITION_PATTERN.match(condition)
+        if not match:
+            return condition
+        group, sign, comparator, value = match.groups()
+        if sign:
+            normalized = f"{group}{sign} {comparator} {value}"
+        else:
+            normalized = f"{group}(*) {comparator} {value}"
+        return normalized.strip()
 
     def _truncate(self, text: str, max_len: int) -> str:
         if len(text) > max_len:
@@ -349,8 +376,20 @@ class ResultBrowserScreen(BaseScreen):
             return f"{X[0]}+{len(X)-1}"
         return str(X)[:15] if X else ""
 
+    def _stringify_value(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (dict, list)):
+            try:
+                return json.dumps(value, ensure_ascii=False)
+            except TypeError:
+                return str(value)
+        return str(value)
+
     def _update_action_bar(self) -> None:
-        actions = "[Space] Select  [C] Confirm Add  [/] Search  [F] Filter  [i] Detail  [o] Coef  [Esc] Back"
+        actions = (
+            "[Space] Select  [C] Confirm Add  [/] Search  [F] Filter  [i] Detail  [o] Coef  [Ctrl+Shift+C] Copy  [Esc] Back"
+        )
         self.query_one("#action_bar", Static).update(actions)
 
     def _update_status(self) -> None:
@@ -390,6 +429,42 @@ class ResultBrowserScreen(BaseScreen):
         if table.cursor_row is not None:
             return min(table.cursor_row, len(self.browser_state.filtered_df) - 1)
         return None
+
+    def _gather_rows_for_copy(self) -> List[pd.Series]:
+        """按照展示顺序获取需要复制的行数据"""
+
+        if self.browser_state is None:
+            return []
+
+        indices: List[int] = []
+        if self.browser_state.selected_indices:
+            indices = sorted(self.browser_state.selected_indices)
+
+        cursor_idx = self._get_selected_row_index()
+        if not indices and cursor_idx is not None:
+            indices = [cursor_idx]
+
+        rows: List[pd.Series] = []
+        for idx in indices:
+            if 0 <= idx < len(self.browser_state.filtered_df):
+                rows.append(self.browser_state.filtered_df.iloc[idx])
+        return rows
+
+    def _format_row_for_copy(self, row: pd.Series) -> str:
+        fields = [
+            ("parent_task_id", row.get("parent_task_id")),
+            ("task_id", row.get("task_id")),
+            ("name", row.get("name")),
+            ("section", row.get("section")),
+            ("y", row.get("y")),
+            ("X", row.get("X")),
+            ("controls", row.get("controls")),
+            ("model", row.get("model")),
+            ("mark", row.get("mark")),
+        ]
+        return "\n".join(
+            f"{key}: {self._stringify_value(value)}" for key, value in fields
+        )
 
     # ========== 事件处理 ==========
 
@@ -444,16 +519,6 @@ class ResultBrowserScreen(BaseScreen):
                 self.browser_state.filters.pop("section", None)
             else:
                 self.browser_state.filters["section"] = event.value
-        elif event.select.id == "name_filter":
-            if event.value == "all":
-                self.browser_state.filters.pop("name", None)
-            else:
-                self.browser_state.filters["name"] = event.value
-        elif event.select.id == "mark_filter":
-            if event.value == "all":
-                self.browser_state.filters.pop("mark", None)
-            else:
-                self.browser_state.filters["mark"] = event.value
 
         self._apply_filters()
 
@@ -558,6 +623,7 @@ class ResultBrowserScreen(BaseScreen):
 
         # 获取选中的行并添加到 TableMatrix
         selected_task_ids = []
+        selected_parent_ids: List[Optional[str]] = []
         skipped_duplicates = 0
         refreshed_existing = 0
         for idx in sorted(self.browser_state.selected_indices):
@@ -575,6 +641,7 @@ class ResultBrowserScreen(BaseScreen):
                     skipped_duplicates += 1
                     continue
                 selected_task_ids.append(task_id)
+                selected_parent_ids.append(parent_id or None)
 
                 # 获取 exec_result
                 exec_result = self.shared_state.get_exec_result(task_id)
@@ -619,7 +686,7 @@ class ResultBrowserScreen(BaseScreen):
             return
 
         self.notify_user(f"Adding {len(selected_task_ids)} column(s)...")
-        self.post_message(ColumnsAdded(table_index, selected_task_ids))
+        self.post_message(ColumnsAdded(table_index, selected_task_ids, selected_parent_ids))
         if skipped_duplicates:
             note = f"Skipped {skipped_duplicates} duplicate selection(s)."
             if refreshed_existing:
@@ -696,8 +763,13 @@ class ResultBrowserScreen(BaseScreen):
         search_input = self.query_one("#search_input", Input)
         search_input.value = ":filter "
         search_input.focus()
-        # 将光标移到末尾
-        search_input.cursor_position = len(search_input.value)
+        cursor = len(search_input.value)
+
+        def _position_cursor() -> None:
+            search_input.cursor_position = cursor
+            search_input.selection = Selection.cursor(cursor)
+
+        self.call_after_refresh(_position_cursor)
 
     def action_refresh(self) -> None:
         """刷新数据"""
@@ -705,6 +777,28 @@ class ResultBrowserScreen(BaseScreen):
             self.browser_state.df = self.results_df.copy()
             self._apply_filters()
             self.notify_user("Refreshed")
+
+    async def action_copy_selection(self) -> None:
+        """复制选中行或输入框内容"""
+
+        if await self._copy_input_if_focused():
+            return
+
+        if self.browser_state is None:
+            self.notify_user("Browser state not initialized", severity="error")
+            return
+
+        rows = self._gather_rows_for_copy()
+        if not rows:
+            self.notify_user("No row is selected", severity="warning")
+            return
+
+        blocks = [self._format_row_for_copy(row) for row in rows]
+        copy_text = "\n\n".join(blocks)
+        await self._copy_text(
+            copy_text,
+            success_message=f"Copied {len(rows)} row(s) to clipboard.",
+        )
 
     def action_go_back(self) -> None:
         """返回上一界面"""

@@ -374,6 +374,11 @@ fmb_two_pass <- function(data,
 # 从 {{ input_data_variable }} 读取，清洗后存入 {{ output_data_variable }}
 specified_columns <- c({% for field in fields %}"{{ field }}"{% if not loop.last %}, {% endif %}{% endfor %})
 
+missing_columns <- setdiff(specified_columns, colnames({{ input_data_variable }}))
+if (length(missing_columns) > 0) {
+  stop(sprintf("[clean_sample] Missing columns: %s", paste(missing_columns, collapse = ", ")))
+}
+
 rows_ok <- stats::complete.cases({{ input_data_variable }}[, specified_columns, drop = FALSE])
 {{ output_data_variable }} <- {{ input_data_variable }}[rows_ok, , drop = FALSE]
 {%- endmacro %}

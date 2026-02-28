@@ -8,15 +8,15 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, Center
-from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, Input, Label, Select, Static, DataTable
 from textual.binding import Binding
 
 if TYPE_CHECKING:
     from reg_monkey.tui.state import SharedState
 
+from ..clipboard import ClipboardModalScreen
 
-class NewTableDialog(ModalScreen[Optional[dict]]):
+class NewTableDialog(ClipboardModalScreen[Optional[dict]]):
     """新建表格对话框"""
 
     BINDINGS = [
@@ -103,7 +103,7 @@ class NewTableDialog(ModalScreen[Optional[dict]]):
         self.dismiss(None)
 
 
-class ConfirmDialog(ModalScreen[bool]):
+class ConfirmDialog(ClipboardModalScreen[bool]):
     """确认对话框"""
 
     BINDINGS = [
@@ -176,7 +176,7 @@ class ConfirmDialog(ModalScreen[bool]):
         self.dismiss(False)
 
 
-class RenameDialog(ModalScreen[Optional[str]]):
+class RenameDialog(ClipboardModalScreen[Optional[str]]):
     """重命名对话框"""
 
     BINDINGS = [
@@ -247,7 +247,7 @@ class RenameDialog(ModalScreen[Optional[str]]):
         self.dismiss(None)
 
 
-class EditDescriptionDialog(ModalScreen[Optional[str]]):
+class EditDescriptionDialog(ClipboardModalScreen[Optional[str]]):
     """编辑描述对话框"""
 
     BINDINGS = [
@@ -309,13 +309,14 @@ class EditDescriptionDialog(ModalScreen[Optional[str]]):
         self.dismiss(None)
 
 
-class TaskDetailModal(ModalScreen):
+class TaskDetailModal(ClipboardModalScreen):
     """任务详情弹出面板"""
 
     BINDINGS = [
         Binding("escape", "close", "Close"),
         Binding("space", "toggle_select", "Toggle Select"),
         Binding("o", "preview_coefficients", "View Coefficients"),
+        Binding("ctrl+shift+c", "copy_selection", "Copy"),
     ]
 
     CSS = """
@@ -376,13 +377,68 @@ class TaskDetailModal(ModalScreen):
             yield Static(f"Mark:         {row.get('mark', 'N/A')}", classes="detail-row")
 
             yield Static("")
-            yield Static("[Esc] Close    [Space] Toggle Select    [o] View Coefficients")
+            yield Static(
+                "[Esc] Close    [Space] Toggle Select    [o] View Coefficients    [Ctrl+Shift+C] Copy"
+            )
 
     def action_close(self) -> None:
         self.dismiss()
 
+    @staticmethod
+    def _format_value(value: Any) -> str:
+        if value is None or value == "":
+            return "N/A"
+        return str(value)
 
-class StepwiseSelectModal(ModalScreen[bool]):
+    def _serialize_detail_text(self) -> str:
+        row = self.task_row
+        sections = [
+            (
+                "Task",
+                [
+                    ("Task ID", row.get("task_id", "N/A")),
+                    ("Parent Task", row.get("parent_task_id", "N/A")),
+                    ("Name", row.get("name", "N/A")),
+                    ("Section", row.get("section", "N/A")),
+                ],
+            ),
+            (
+                "Model",
+                [
+                    ("Model", row.get("model", "N/A")),
+                    ("Dataset", row.get("dataset", "N/A")),
+                    ("Y", row.get("y", "N/A")),
+                    ("X", row.get("X", "N/A")),
+                    ("Controls", row.get("controls", "N/A")),
+                    ("FE", row.get("category_controls", "N/A")),
+                    ("Subset", row.get("subset", "N/A")),
+                ],
+            ),
+            (
+                "Result",
+                [
+                    ("Mark", row.get("mark", "N/A")),
+                ],
+            ),
+        ]
+
+        lines: List[str] = []
+        for title, fields in sections:
+            lines.append(title)
+            for label, value in fields:
+                lines.append(f"  {label}: {self._format_value(value)}")
+            lines.append("")
+
+        return "\n".join(lines).strip()
+
+    async def action_copy_selection(self) -> None:
+        if await self._copy_input_if_focused():
+            return
+        detail_text = self._serialize_detail_text()
+        await self._copy_text(detail_text, success_message="Copied task detail to clipboard.")
+
+
+class StepwiseSelectModal(ClipboardModalScreen[bool]):
     """Stepwise 步骤选择对话框"""
 
     BINDINGS = [
@@ -391,6 +447,7 @@ class StepwiseSelectModal(ModalScreen[bool]):
         Binding("n", "clear_all", "None"),
         Binding("enter", "confirm", "Apply"),
         Binding("escape", "cancel", "Cancel"),
+        Binding("ctrl+shift+c", "copy_selection", "Copy"),
     ]
 
     CSS = """
@@ -494,7 +551,9 @@ class StepwiseSelectModal(ModalScreen[bool]):
                 yield Static("[yellow]No stepwise results for this task.[/yellow]")
             else:
                 yield DataTable(id="step_table")
-                yield Static("[Space] Toggle  [A] All  [N] None  [Enter] Apply  [Esc] Cancel")
+                yield Static(
+                    "[Space] Toggle  [A] All  [N] None  [Enter] Apply  [Esc] Cancel  [Ctrl+Shift+C] Copy"
+                )
             with Horizontal(classes="button-row"):
                 yield Button(self._toggle_button_label(), id="btn_toggle_stepwise")
                 yield Button("Apply", id="btn_apply", variant="primary")
@@ -607,12 +666,39 @@ class StepwiseSelectModal(ModalScreen[bool]):
             text = text[1:-1]
         return text or f"Step {step_idx}"
 
+    def _format_row_for_copy(self, row: dict) -> str:
+        lines = [
+            f"Step: {row.get('index')}",
+            f"Label: {row.get('label')}",
+            f"Controls: {row.get('controls')}",
+            f"Observations: {row.get('observations')}",
+            f"R^2: {row.get('r_squared')}",
+            f"Marked: {'Yes' if row.get('marked') else 'No'}",
+        ]
+        return "\n".join(lines)
 
-class CoefficientsModal(ModalScreen):
+    async def action_copy_selection(self) -> None:
+        if await self._copy_input_if_focused():
+            return
+        if not self.rows:
+            self.app.notify("No stepwise rows to copy", severity="warning")
+            return
+        table = self.query_one("#step_table", DataTable)
+        row_index = table.cursor_row or 0
+        row_index = min(row_index, len(self.rows) - 1)
+        row = self.rows[row_index]
+        await self._copy_text(
+            self._format_row_for_copy(row),
+            success_message=f"Copied step {row.get('index')} info.",
+        )
+
+
+class CoefficientsModal(ClipboardModalScreen):
     """系数预览弹出面板"""
 
     BINDINGS = [
         Binding("escape", "close", "Close"),
+        Binding("ctrl+shift+c", "copy_selection", "Copy"),
     ]
 
     CSS = """
@@ -643,12 +729,13 @@ class CoefficientsModal(ModalScreen):
         super().__init__(**kwargs)
         self.task_id = task_id
         self.exec_result = exec_result
+        self.rendered_rows: List[dict[str, str]] = []
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Static(f"COEFFICIENTS: {self.task_id}", classes="dialog-title")
             yield DataTable(id="coef_table")
-            yield Static("[Esc] Close    [↑↓] Scroll")
+            yield Static("[Esc] Close    [↑↓] Scroll    [Ctrl+Shift+C] Copy")
 
     def _get_field(self, row, *keys, default=""):
         """尝试多个可能的字段名，返回第一个非 None 的值"""
@@ -666,7 +753,9 @@ class CoefficientsModal(ModalScreen):
 
     def on_mount(self) -> None:
         table = self.query_one("#coef_table", DataTable)
+        table.cursor_type = "row"
         table.add_columns("Variable", "Estimate", "Std.Error", "t-value", "p-value", "Sig")
+        self.rendered_rows.clear()
 
         if self.exec_result is None:
             table.add_row("No results", "", "", "", "", "")
@@ -698,7 +787,8 @@ class CoefficientsModal(ModalScreen):
 
                 sig = self._get_significance(p_value)
 
-                table.add_row(
+                self._append_row(
+                    table,
                     str(variable),
                     self._format_number(estimate, 4),
                     self._format_number(std_error, 4),
@@ -716,7 +806,8 @@ class CoefficientsModal(ModalScreen):
 
                 sig = self._get_significance(p_value)
 
-                table.add_row(
+                self._append_row(
+                    table,
                     str(variable),
                     self._format_number(estimate, 4),
                     self._format_number(std_error, 4),
@@ -724,6 +815,9 @@ class CoefficientsModal(ModalScreen):
                     self._format_number(p_value, 4),
                     sig,
                 )
+
+        if self.rendered_rows:
+            table.focus()
 
     def _get_significance(self, pval: Any) -> str:
         """获取显著性标记"""
@@ -741,11 +835,51 @@ class CoefficientsModal(ModalScreen):
         except (ValueError, TypeError):
             return ""
 
+    def _append_row(
+        self,
+        table: DataTable,
+        variable: str,
+        estimate: str,
+        std_error: str,
+        t_value: str,
+        p_value: str,
+        sig: str,
+    ) -> None:
+        row_data = {
+            "Variable": variable,
+            "Estimate": estimate,
+            "Std.Error": std_error,
+            "t-value": t_value,
+            "p-value": p_value,
+            "Sig": sig,
+        }
+        self.rendered_rows.append(row_data)
+        table.add_row(variable, estimate, std_error, t_value, p_value, sig)
+
+    def _format_row_for_copy(self, row: dict[str, str]) -> str:
+        keys = ["Variable", "Estimate", "Std.Error", "t-value", "p-value", "Sig"]
+        return "\n".join(f"{key}: {row.get(key, '')}" for key in keys)
+
+    async def action_copy_selection(self) -> None:
+        if await self._copy_input_if_focused():
+            return
+        if not self.rendered_rows:
+            self.app.notify("No coefficients to copy", severity="warning")
+            return
+        table = self.query_one("#coef_table", DataTable)
+        row_index = table.cursor_row or 0
+        row_index = min(row_index, len(self.rendered_rows) - 1)
+        row = self.rendered_rows[row_index]
+        await self._copy_text(
+            self._format_row_for_copy(row),
+            success_message=f"Copied coefficient for {row.get('Variable', 'variable')}",
+        )
+
     def action_close(self) -> None:
         self.dismiss()
 
 
-class HelpScreen(ModalScreen):
+class HelpScreen(ClipboardModalScreen):
     """帮助界面"""
 
     BINDINGS = [
@@ -787,6 +921,7 @@ class HelpScreen(ModalScreen):
             yield Static("─── Global ───", classes="section-title")
             yield Static("  Ctrl+S     Save configuration")
             yield Static("  Ctrl+Q     Quit application")
+            yield Static("  Ctrl+Shift+C Copy selection")
             yield Static("  F1 / ?     Show this help")
             yield Static("  Esc        Go back / Cancel")
 
@@ -824,7 +959,7 @@ class HelpScreen(ModalScreen):
         self.dismiss()
 
 
-class ConfirmQuitScreen(ModalScreen[bool]):
+class ConfirmQuitScreen(ClipboardModalScreen[bool]):
     """退出确认界面（有未保存修改时）"""
 
     BINDINGS = [
@@ -905,7 +1040,7 @@ class ConfirmQuitScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
-class ExportDialog(ModalScreen[Optional[dict]]):
+class ExportDialog(ClipboardModalScreen[Optional[dict]]):
     """导出对话框"""
 
     BINDINGS = [
